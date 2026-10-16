@@ -1,6 +1,8 @@
 // The persona-chat bundle, loaded by MCPWiki's extension host (MCPWiki docs/extensions.md, contract 1).
-// For now a placeholder that proves the integration: it shows that it was loaded, below articles and on its page.
-// It runs in the wiki's origin: build the DOM with textContent only and never store or log tokens.
+// For now it proves the integration: it shows that it was loaded below articles, and its page runs a connection
+// test (ticket over HTTPS, then WebSocket ping / pong).
+// It runs in the wiki's origin: build the DOM with textContent only and never store or log tokens. The access token
+// goes to the extension's own ticket endpoint only.
 
 interface HostArticle {
   id: string;
@@ -12,6 +14,7 @@ interface HostContext {
   me: { username: string; role: 'admin' | 'editor' | 'viewer' };
   article?: HostArticle;
   signal: AbortSignal;
+  getAccessToken(): Promise<string | null>;
 }
 interface Host {
   contracts: number[];
@@ -26,7 +29,7 @@ interface Host {
 
 export const EXTENSION_ID = 'persona-chat';
 export const CONTRACT = 1;
-/** Replaced by scripts/build-bundle.mjs with the bundle's content hash (the version shown to users). */
+/** Replaced by scripts/build.mjs with the bundle's content hash (the version shown to users). */
 const BUILD = '__BUILD__';
 
 const text = (tag: string, value: string, cls?: string) => {
@@ -35,6 +38,45 @@ const text = (tag: string, value: string, cls?: string) => {
   el.textContent = value;
   return el;
 };
+
+/** Endpoints, deployed next to the bundle (they are only known after the stack is deployed). */
+async function endpoints(): Promise<{ ticketUrl: string; socketUrl: string }> {
+  const r = await fetch(`/ext/${EXTENSION_ID}/config.json`, { cache: 'no-store' });
+  if (!r.ok) throw new Error(`config.json: ${r.status}`);
+  return (await r.json()) as { ticketUrl: string; socketUrl: string };
+}
+
+/** Ticket over HTTPS, then WebSocket; one ping, the pong is shown with its round-trip time. */
+async function connectionTest(ctx: HostContext, out: HTMLElement) {
+  const line = (s: string, cls?: string) => out.append(text('li', s, cls));
+  out.replaceChildren();
+  try {
+    const { ticketUrl, socketUrl } = await endpoints();
+    const token = await ctx.getAccessToken();
+    if (!token) return line('サインインしていません。', 'error');
+    const r = await fetch(ticketUrl, { method: 'POST', headers: { authorization: `Bearer ${token}` }, signal: ctx.signal });
+    if (!r.ok) return line(`チケットを発行できませんでした（HTTP ${r.status}）。`, 'error');
+    const { ticket, maxConnectionSec } = (await r.json()) as { ticket: string; maxConnectionSec: number };
+    line(`チケットを受け取りました（接続は最長 ${Math.round(maxConnectionSec / 60)} 分）。`);
+    const socket = new WebSocket(`${socketUrl}?ticket=${encodeURIComponent(ticket)}`);
+    ctx.signal.addEventListener('abort', () => socket.close());
+    const sent = performance.now();
+    socket.addEventListener('open', () => {
+      line('WebSocket に接続しました。ping を送ります。');
+      socket.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+    });
+    socket.addEventListener('message', (ev) => {
+      const m = JSON.parse(String(ev.data)) as { type: string; username?: string; role?: string };
+      if (m.type === 'pong') line(`pong を受け取りました: ${m.username}（${m.role}）・往復 ${Math.round(performance.now() - sent)} ms`, 'ok');
+      else line(`応答: ${m.type}`);
+      socket.close();
+    });
+    socket.addEventListener('close', (ev) => line(`切断しました（コード ${ev.code}）。`, 'muted'));
+    socket.addEventListener('error', () => line('WebSocket に接続できませんでした。', 'error'));
+  } catch (e) {
+    if (!ctx.signal.aborted) line(`失敗しました: ${e instanceof Error ? e.message : String(e)}`, 'error');
+  }
+}
 
 const host = (globalThis as { mcpwikiHost?: Host }).mcpwikiHost;
 if (host?.contracts.includes(CONTRACT)) {
@@ -47,10 +89,15 @@ if (host?.contracts.includes(CONTRACT)) {
       el.append(text('p', `persona-chat 拡張が読み込まれました（契約 v${ctx.contract}、版 ${BUILD}）。`, 'muted'));
     },
     page(ctx, el, subpath) {
+      const out = document.createElement('ul');
+      const button = text('button', '接続テスト');
+      button.addEventListener('click', () => void connectionTest(ctx, out));
       el.append(
         text('h1', 'Persona Chat'),
         text('p', `拡張が読み込まれました。契約 v${ctx.contract}、版 ${BUILD}。`),
         text('p', `利用者: ${ctx.me.username}（${ctx.me.role}）・パス: ${subpath}`, 'muted'),
+        button,
+        out,
       );
     },
   });

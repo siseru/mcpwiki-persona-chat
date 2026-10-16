@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { App, DefaultStackSynthesizer, PermissionsBoundary, Tags, Validations } from 'aws-cdk-lib';
 import { AwsSolutionsChecks } from 'cdk-nag';
 import type { IConstruct } from 'constructs';
-import { ExtensionStack } from './extension-stack.js';
+import { ExtensionStack, type WikiLink } from './extension-stack.js';
 import { DEV_BOUNDARY_NAME, DEV_QUALIFIER, GuardStack } from './guard-stack.js';
 
 // build/src/infra/app.js -> repository root
@@ -21,10 +21,11 @@ const modelsCtx = app.node.tryGetContext('devBedrockModels') as string[] | strin
 const devBedrockModels: string[] = typeof modelsCtx === 'string' ? JSON.parse(modelsCtx) : (modelsCtx ?? []);
 
 /**
- * The MCPWiki deployment each environment plugs into: { "dev": { "distributionArn": "..." }, "prod": {...} }.
+ * The MCPWiki deployment each environment plugs into (config/wiki.example.json):
+ * { "dev": { "distributionArn", "origin", "issuer", "clientId" }, "prod": {...} }.
  * Kept out of git: -c wiki='<json>', the secret PERSONACHAT_WIKI, or config/wiki.local.json.
  */
-type WikiConfig = Partial<Record<'dev' | 'prod', { distributionArn: string }>>;
+type WikiConfig = Partial<Record<'dev' | 'prod', WikiLink>>;
 function loadWiki(): WikiConfig {
   const ctx = app.node.tryGetContext('wiki') as WikiConfig | string | undefined;
   if (ctx) return typeof ctx === 'string' ? (JSON.parse(ctx) as WikiConfig) : ctx;
@@ -43,16 +44,20 @@ const guard = new GuardStack(app, 'PersonaChat-guard', { env: { account, region 
 costTags(guard, 'shared', 'guard');
 
 for (const envName of ['dev', 'prod'] as const) {
-  const arn = wiki[envName]?.distributionArn;
-  if (!arn) continue;
-  // Interpolated into the bucket policy: the ARN of one distribution, nothing else.
-  if (!/^arn:aws:cloudfront::\d{12}:distribution\/E[A-Z0-9]{8,20}$/.test(arn)) throw new Error(`wiki.${envName}.distributionArn is not a CloudFront distribution ARN`);
+  const link = wiki[envName];
+  if (!link) continue;
+  // Interpolated into the bucket policy, CORS and the functions' configuration: validated strictly.
+  const bad = (k: string) => new Error(`wiki.${envName}.${k} is invalid`);
+  if (!/^arn:aws:cloudfront::\d{12}:distribution\/E[A-Z0-9]{8,20}$/.test(link.distributionArn ?? '')) throw bad('distributionArn');
+  if (!/^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(link.origin ?? '')) throw bad('origin');
+  if (!/^https:\/\/cognito-idp\.[a-z0-9-]+\.amazonaws\.com\/[a-z0-9-]+_[A-Za-z0-9]+$/.test(link.issuer ?? '')) throw bad('issuer');
+  if (!/^[a-z0-9]{20,40}$/.test(link.clientId ?? '')) throw bad('clientId');
   const stack = new ExtensionStack(app, `PersonaChat-${envName}`, {
     env: { account, region },
     envName,
     repoRoot,
     extensionId: 'persona-chat',
-    wikiDistributionArn: arn,
+    wiki: link,
     // dev uses its own CDK bootstrap (qualifier pcdev) whose roles carry the dev permissions boundary.
     ...(envName === 'dev'
       ? { synthesizer: new DefaultStackSynthesizer({ qualifier: DEV_QUALIFIER }), permissionsBoundary: PermissionsBoundary.fromName(DEV_BOUNDARY_NAME) }
