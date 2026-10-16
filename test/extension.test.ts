@@ -96,6 +96,8 @@ test('the ticket API answers the wiki page only, the socket needs a ticket, and 
   // Memory: the route function adds events and lists records of this one memory; nothing deletes or edits them.
   const mem = statements.filter((s) => JSON.stringify(s.Action).includes('bedrock-agentcore:'));
   assert.deepEqual(mem.map((s) => [s.Action].flat().sort()).sort(), [['bedrock-agentcore:CreateEvent'], ['bedrock-agentcore:ListMemoryRecords']]);
+  // Room jobs carry player text: both queues encrypted, TLS only.
+  for (const [, q] of of('AWS::SQS::Queue')) assert.equal(q.Properties.SqsManagedSseEnabled, true);
   const [[, memRes]] = of('AWS::BedrockAgentCore::Memory') as [string, any][];
   assert.equal(memRes.Properties.Name, 'PersonaChat_dev');
   assert.deepEqual(memRes.Properties.MemoryStrategies[0].SemanticMemoryStrategy.NamespaceTemplates, ['/npc/{npc}/pc/{pc}/']);

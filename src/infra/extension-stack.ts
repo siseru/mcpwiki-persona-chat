@@ -163,13 +163,15 @@ export class ExtensionStack extends Stack {
     wsFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['bedrock-agentcore:ListMemoryRecords'], resources: [memory.attrMemoryArn] }));
     workerFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['bedrock-agentcore:CreateEvent'], resources: [memory.attrMemoryArn] }));
     // Lines of a room, in order: FIFO, one message group per facility. Failed jobs end in the dead-letter queue.
-    const deadLetters = new sqs.Queue(this, 'RoomJobsDlq', { fifo: true, retentionPeriod: Duration.days(4), enforceSSL: true });
+    // Encrypted with SQS-managed keys (lines are player text; no key sharing needed).
+    const deadLetters = new sqs.Queue(this, 'RoomJobsDlq', { fifo: true, retentionPeriod: Duration.days(4), enforceSSL: true, encryption: sqs.QueueEncryption.SQS_MANAGED });
     const roomJobs = new sqs.Queue(this, 'RoomJobs', {
       fifo: true,
       visibilityTimeout: Duration.seconds(120), // >= the worker's timeout
       retentionPeriod: Duration.hours(1), // a line nobody answered within an hour is no longer worth answering
       deadLetterQueue: { queue: deadLetters, maxReceiveCount: 2 },
       enforceSSL: true,
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
     });
     roomJobs.grantSendMessages(wsFn);
     workerFn.addEventSource(new eventSources.SqsEventSource(roomJobs, { batchSize: 1 }));
