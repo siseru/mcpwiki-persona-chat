@@ -46,33 +46,42 @@ async function endpoints(): Promise<{ ticketUrl: string; socketUrl: string }> {
   return (await r.json()) as { ticketUrl: string; socketUrl: string };
 }
 
-/** Ticket over HTTPS, then WebSocket; one ping, the pong is shown with its round-trip time. */
-async function connectionTest(ctx: HostContext, out: HTMLElement) {
+/**
+ * Ticket over HTTPS, then WebSocket; one ping. Shows how long each step took: getting the ticket, opening the
+ * socket (TLS + upgrade + authorizer + $connect) and the ping round trip on the open socket.
+ */
+async function connectionTest(ctx: HostContext, out: HTMLElement): Promise<void> {
   const line = (s: string, cls?: string) => out.append(text('li', s, cls));
   out.replaceChildren();
+  const ms = (from: number) => `${Math.round(performance.now() - from)} ms`;
   try {
+    const t0 = performance.now();
     const { ticketUrl, socketUrl } = await endpoints();
     const token = await ctx.getAccessToken();
     if (!token) return line('サインインしていません。', 'error');
     const r = await fetch(ticketUrl, { method: 'POST', headers: { authorization: `Bearer ${token}` }, signal: ctx.signal });
     if (!r.ok) return line(`チケットを発行できませんでした（HTTP ${r.status}）。`, 'error');
     const { ticket, maxConnectionSec } = (await r.json()) as { ticket: string; maxConnectionSec: number };
-    line(`チケットを受け取りました（接続は最長 ${Math.round(maxConnectionSec / 60)} 分）。`);
+    line(`チケットを受け取りました（${ms(t0)}、接続は最長 ${Math.round(maxConnectionSec / 60)} 分）。`);
+    const t1 = performance.now();
     const socket = new WebSocket(`${socketUrl}?ticket=${encodeURIComponent(ticket)}`);
     ctx.signal.addEventListener('abort', () => socket.close());
-    const sent = performance.now();
-    socket.addEventListener('open', () => {
-      line('WebSocket に接続しました。ping を送ります。');
-      socket.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+    let t2 = 0;
+    await new Promise<void>((resolve) => {
+      socket.addEventListener('open', () => {
+        line(`WebSocket に接続しました（${ms(t1)}）。ping を送ります。`);
+        t2 = performance.now();
+        socket.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+      });
+      socket.addEventListener('message', (ev) => {
+        const m = JSON.parse(String(ev.data)) as { type: string; username?: string; role?: string };
+        if (m.type === 'pong') line(`pong を受け取りました: ${m.username}（${m.role}）・ping の往復 ${ms(t2)}`, 'ok');
+        else line(`応答: ${m.type}`);
+        socket.close();
+      });
+      socket.addEventListener('close', (ev) => (line(`切断しました（コード ${ev.code}）。`, 'muted'), resolve()));
+      socket.addEventListener('error', () => line('WebSocket に接続できませんでした。', 'error'));
     });
-    socket.addEventListener('message', (ev) => {
-      const m = JSON.parse(String(ev.data)) as { type: string; username?: string; role?: string };
-      if (m.type === 'pong') line(`pong を受け取りました: ${m.username}（${m.role}）・往復 ${Math.round(performance.now() - sent)} ms`, 'ok');
-      else line(`応答: ${m.type}`);
-      socket.close();
-    });
-    socket.addEventListener('close', (ev) => line(`切断しました（コード ${ev.code}）。`, 'muted'));
-    socket.addEventListener('error', () => line('WebSocket に接続できませんでした。', 'error'));
   } catch (e) {
     if (!ctx.signal.aborted) line(`失敗しました: ${e instanceof Error ? e.message : String(e)}`, 'error');
   }
@@ -90,8 +99,12 @@ if (host?.contracts.includes(CONTRACT)) {
     },
     page(ctx, el, subpath) {
       const out = document.createElement('ul');
-      const button = text('button', '接続テスト');
-      button.addEventListener('click', () => void connectionTest(ctx, out));
+      const button = text('button', '接続テスト') as HTMLButtonElement;
+      // One test at a time, so the lines of two runs never mix.
+      button.addEventListener('click', () => {
+        button.disabled = true;
+        void connectionTest(ctx, out).finally(() => (button.disabled = false));
+      });
       el.append(
         text('h1', 'Persona Chat'),
         text('p', `拡張が読み込まれました。契約 v${ctx.contract}、版 ${BUILD}。`),
