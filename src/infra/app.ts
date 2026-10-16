@@ -9,7 +9,7 @@ const app = new App();
 const account = process.env.CDK_DEFAULT_ACCOUNT;
 const region = (app.node.tryGetContext('region') as string | undefined) ?? process.env.CDK_DEFAULT_REGION ?? 'us-west-2';
 
-// cdk.json context, or -c devBedrockModels='["anthropic.claude-haiku-*"]'.
+// cdk.json context, or -c devBedrockModels='["anthropic.claude-haiku-5-5"]'.
 const modelsCtx = app.node.tryGetContext('devBedrockModels') as string[] | string | undefined;
 const devBedrockModels: string[] = typeof modelsCtx === 'string' ? JSON.parse(modelsCtx) : (modelsCtx ?? []);
 

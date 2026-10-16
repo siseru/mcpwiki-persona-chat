@@ -34,6 +34,6 @@ npx cdk deploy PersonaChat-guard
 node scripts/bootstrap-dev.mjs
 ```
 
-- dev で Bedrock を使うときは、モデルの ID（ワイルドカード可）を `cdk.json` の `devBedrockModels` に書き、ガードを配備し直します。例: `["anthropic.claude-haiku-*"]`。基盤モデル（全リージョン）と、US の推論プロファイル（`us.<ID>`）の両方が許可されます。
+- dev で Bedrock を使うときは、モデルの ID（ワイルドカード可）を `cdk.json` の `devBedrockModels` に書き、ガードを配備し直します。例: `["anthropic.claude-haiku-5-5"]`。us-west-2 の Anthropic モデルは推論プロファイル経由でしか呼べません（[docs/spike.md](spike.md)）。基盤モデル（全リージョン）と、US の推論プロファイル（`us.<ID>`）の両方が許可されます。
 - Bedrock の Anthropic モデルは、アカウントで 1 回、利用目的の申請が必要です。境界はこの申請を dev に許さないので、管理者がコンソールから行います。
 - prod は、既定の bootstrap（MCPWiki の prod と同じもの）を使います。
