@@ -440,6 +440,8 @@ test('the NPC greets from its snapshot, replies are streamed, and the conversati
   assert.match(call.system, /港の宿/);
   assert.match(call.system, /アリス/);
   assert.ok(!call.system.includes('密輸'), 'no secrets in the prompt');
+  // The DM owns the world's facts: no new named people, events, jobs or rewards (decided 2026-10-16).
+  assert.match(call.system, /never introduce new named people, places,\s+events, rumours with specifics, jobs or rewards/);
   assert.match(call.messages.at(-1)!.text, /^<<PLAYER-[0-9a-f]{24}\n部屋は空いてる？\nPLAYER-[0-9a-f]{24}>>$/);
   assert.ok(!JSON.stringify(s.logs).includes('部屋は空いてる'), 'no message text in logs');
 });
