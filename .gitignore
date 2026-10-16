@@ -1,0 +1,11 @@
+node_modules/
+build/
+dist/
+cdk.out/
+cdk.out.synth/
+*.zip
+.env
+outputs*.json
+deploy-*.log
+config/*.local.json
+supply-chain-report/

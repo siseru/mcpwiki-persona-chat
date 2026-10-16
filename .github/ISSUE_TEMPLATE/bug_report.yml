@@ -1,0 +1,34 @@
+name: Bug report / バグ報告
+description: Something does not work as expected / 期待どおりに動かない
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not include secrets, tokens, account ids, domains or personal data.** Security issues: use "Report a vulnerability" instead.
+        **秘密情報・トークン・アカウント ID・ドメイン・個人情報は書かないでください。** 脆弱性は「Report a vulnerability」から報告してください。
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened / 何が起きたか
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce / 再現手順
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior / 期待する動作
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area / 対象
+      options: [Extension UI, Conversation (NPC), DM tools, Infrastructure (CDK), CI/CD, Docs]
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit

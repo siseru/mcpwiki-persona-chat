@@ -1,0 +1,31 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    # Supply-chain cooldown: don't propose versions until they have been public for a while
+    # (compromised releases are usually detected and pulled within days). CI enforces the same age.
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    groups:
+      aws:
+        patterns: ['aws-cdk*', '@aws-sdk/*', 'cdk-nag', 'constructs']
+      dev-tools:
+        dependency-type: development
+        exclude-patterns: ['aws-cdk*', '@aws-sdk/*', 'cdk-nag', 'constructs']
+    ignore:
+      # Type definitions must match the runtime (Lambda nodejs24.x, CI Node 24); bump together with the runtime.
+      - dependency-name: '@types/node'
+        update-types: ['version-update:semver-major']
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      # One PR for all actions so pinned SHAs (e.g. codeql-action init/analyze/upload-sarif) move together.
+      actions:
+        patterns: ['*']

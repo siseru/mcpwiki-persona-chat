@@ -1,0 +1,8 @@
+# CodeQL configuration (used by .github/workflows/codeql.yml).
+name: persona-chat
+queries:
+  - uses: security-extended
+paths-ignore:
+  - build
+  - cdk.out
+  - node_modules

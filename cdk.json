@@ -1,0 +1,16 @@
+{
+  "app": "node build/src/infra/app.js",
+  "watch": {
+    "include": [
+      "src/**"
+    ]
+  },
+  "context": {
+    "region": "us-west-2",
+    "@aws-cdk/aws-iam:minimizePolicies": true,
+    "@aws-cdk/core:checkSecretUsage": true,
+    "@aws-cdk/core:enablePartitionLiterals": true,
+    "cli-telemetry": false,
+    "devBedrockModels": []
+  }
+}

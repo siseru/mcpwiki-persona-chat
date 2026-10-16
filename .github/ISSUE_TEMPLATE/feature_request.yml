@@ -1,0 +1,19 @@
+name: Feature request / 機能要望
+description: Suggest an idea / 新しい機能や改善の提案
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / 解決したい課題
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal / 提案
+  - type: textarea
+    id: security
+    attributes:
+      label: Security / permission impact / セキュリティ・権限への影響
+      description: Does this change who can read or edit articles, or what MCP/CLI can do? / 閲覧・編集できる人や、MCP/CLI でできることが変わりますか？
