@@ -12,7 +12,8 @@ export interface Turn {
 
 export interface ChatProvider {
   /** Streams the NPC's reply; resolves with the full text and token counts. */
-  chat(req: { system: string; messages: Turn[]; maxTokens: number; onDelta: (text: string) => Promise<void> }): Promise<{ text: string; inputTokens: number; outputTokens: number }>;
+  /** `truncated`: the model stopped at maxTokens, mid-sentence. */
+  chat(req: { system: string; messages: Turn[]; maxTokens: number; onDelta: (text: string) => Promise<void> }): Promise<{ text: string; inputTokens: number; outputTokens: number; truncated?: boolean }>;
 }
 
 export const MAX_SAY_CHARS = 500;
@@ -59,10 +60,19 @@ export function buildChat(facility: FacilitySnapshot, npc: NpcSnapshot, pcName: 
   return { system: lines.filter(Boolean).join('\n'), messages: history.slice(-HISTORY_TURNS).map(fence), boundary };
 }
 
-/** What may be sent to the player: control characters removed, length capped, the fence never echoed. */
-export function cleanReply(text: string, boundary: string): string {
-  return clean(text.split(boundary).join('')).slice(0, MAX_REPLY_CHARS);
+/**
+ * What may be sent to the player: control characters removed, length capped, the fence never echoed. A reply cut
+ * off at the token limit ends at its last complete sentence instead of mid-word.
+ */
+export function cleanReply(text: string, boundary: string, truncated = false): string {
+  const out = clean(text.split(boundary).join('')).slice(0, MAX_REPLY_CHARS);
+  if (!truncated) return out;
+  const end = Math.max(...['。', '！', '？', '」', '）', '.', '!', '?'].map((c) => out.lastIndexOf(c)));
+  return end > 0 ? out.slice(0, end + 1) : out;
 }
+
+/** Japanese takes many tokens per character: room for a few sentences plus actions. */
+export const REPLY_MAX_TOKENS = 800;
 
 /**
  * A shared room (Task 10): the answering NPC's own lines are "assistant"; everything else (PCs, other NPCs, people

@@ -257,7 +257,9 @@ const chat: ChatProvider = {
     let text = '';
     let inputTokens = 0;
     let outputTokens = 0;
+    let truncated = false;
     for await (const ev of r.stream ?? []) {
+      if (ev.messageStop?.stopReason === 'max_tokens') truncated = true;
       const delta = ev.contentBlockDelta?.delta?.text;
       if (delta) {
         text += delta;
@@ -265,7 +267,7 @@ const chat: ChatProvider = {
       }
       if (ev.metadata?.usage) ({ inputTokens = 0, outputTokens = 0 } = ev.metadata.usage);
     }
-    return { text, inputTokens, outputTokens };
+    return { text, inputTokens, outputTokens, truncated };
   },
 };
 const llm: LlmProvider = {

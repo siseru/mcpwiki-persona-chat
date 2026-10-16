@@ -1,7 +1,7 @@
 // Request handling, independent of AWS (the Lambda entry points in index.ts wire in DynamoDB, the API Gateway
 // management API and fetch). Never logs tokens, tickets or message text.
 import { ARTICLE_ID_RE, parseFacility, parseNpc, publicView, SchemaError, sourceVersions, type Publication, type WikiArticle } from './catalog.js';
-import { buildRoomChat, clean, cleanReply, MAX_REPLY_CHARS, MAX_SAY_CHARS, type ChatProvider } from './chat.js';
+import { buildRoomChat, clean, cleanReply, MAX_REPLY_CHARS, MAX_SAY_CHARS, REPLY_MAX_TOKENS, type ChatProvider } from './chat.js';
 import { buildPrompt, DRAFT_TOOL, DraftError, parseDraft, type LlmProvider } from './draft.js';
 import { RECALL_MAX, sessionIdOf, type MemoryProvider } from './memory.js';
 import { AuthError, type TokenVerifier } from './jwt.js';
@@ -439,7 +439,7 @@ export async function handleRoomJob(d: Deps, job: Job): Promise<void> {
     const r = await d.chat.chat({
       system,
       messages,
-      maxTokens: 400,
+      maxTokens: REPLY_MAX_TOKENS,
       // Deltas go out as they come, but never past the reply cap; the final text is cleaned once more.
       onDelta: async (delta) => {
         const piece = delta.split(boundary).join('').slice(0, Math.max(0, MAX_REPLY_CHARS - sent));
@@ -447,8 +447,8 @@ export async function handleRoomJob(d: Deps, job: Job): Promise<void> {
         if (piece) await broadcast(d, job.facilityId, { type: 'delta', text: piece }, members);
       },
     });
-    reply = cleanReply(r.text, boundary);
-    d.log({ msg: 'said', sub: speaker.sub, facility: job.facilityId, npc: npc.id, inputTokens: r.inputTokens, outputTokens: r.outputTokens });
+    reply = cleanReply(r.text, boundary, r.truncated);
+    d.log({ msg: 'said', sub: speaker.sub, facility: job.facilityId, npc: npc.id, inputTokens: r.inputTokens, outputTokens: r.outputTokens, truncated: !!r.truncated });
   } catch (e) {
     d.log({ msg: 'model error', sub: speaker.sub, error: e instanceof Error ? e.name : 'unknown' });
     await save();

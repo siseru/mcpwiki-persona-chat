@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { test } from 'node:test';
 import type { Publication } from '../src/backend/catalog.js';
-import { buildChat, buildRoomChat, HISTORY_TURNS, type ChatProvider, type Turn } from '../src/backend/chat.js';
+import { buildChat, buildRoomChat, cleanReply, HISTORY_TURNS, type ChatProvider, type Turn } from '../src/backend/chat.js';
 import { buildPrompt, DRAFT_TOOL, type LlmProvider } from '../src/backend/draft.js';
 import { MemoryFake, namespaceOf, sessionIdOf } from '../src/backend/memory.js';
 import { decideResponder, MemoryRoomStore, STALE_SEC, type RoomLine } from '../src/backend/rooms.js';
@@ -634,4 +634,11 @@ test('memories cannot break out of their fence, and memory outages do not stop t
   assert.equal(down.sent.at(-1)!.data.type, 'done', 'the reply is still delivered');
   assert.deepEqual(down.logs.filter((l) => l.msg === 'memory error').map((l) => [l.op, l.error]), [['recall', 'ThrottlingException'], ['record', 'ServiceUnavailable']]);
   assert.ok(!JSON.stringify(down.logs).includes('こんばんは'), 'no text in logs');
+});
+
+test('a reply cut off at the token limit ends at its last complete sentence', () => {
+  assert.equal(cleanReply('今夜は魚の煮込みだよ。（黒板を叩く）あとは、マーニャ', 'B', true), '今夜は魚の煮込みだよ。（黒板を叩く）');
+  assert.equal(cleanReply('いらっしゃい！ ご注文は', 'B', true), 'いらっしゃい！');
+  assert.equal(cleanReply('句点のない返事', 'B', true), '句点のない返事', 'nothing to cut back to');
+  assert.equal(cleanReply('最後まで言えた。あとは', 'B', false), '最後まで言えた。あとは', 'only when truncated');
 });
