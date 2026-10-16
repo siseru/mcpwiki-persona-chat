@@ -475,12 +475,13 @@ test('a line to the NPC is shown to everybody and answered, streamed to everybod
   assert.deepEqual(s.histories.get('harbor-inn')!.map((l) => `${l.kind}:${l.speaker}`), ['system:', 'system:', 'pc:アリス', 'npc:ミナト']);
   const call = s.chatCalls[0]!;
   assert.match(call.system, /ミナト/);
-  assert.match(call.system, /Also present: ボブ/);
+  assert.match(call.system, /Present right now: アリス and ボブ/);
+  assert.match(call.system, /Always say something \(never only an action\)/);
   assert.ok(!call.system.includes('密輸'), 'no secrets in the prompt');
   assert.match(call.system, /never introduce new named people, places,\s+events, rumours with specifics, jobs or rewards/);
-  // Join lines and the PC's line are merged into one fenced user message.
+  // Comings and goings are not given to the model (a reload would turn into a story); only the PC's line is.
   assert.equal(call.messages.length, 1);
-  assert.match(call.messages[0]!.text, /^<<PLAYER-[0-9a-f]{24}\n（アリス が入ってきました）\n（ボブ が入ってきました）\nアリス: 部屋は空いてる？\nPLAYER-[0-9a-f]{24}>>$/);
+  assert.match(call.messages[0]!.text, /^<<PLAYER-[0-9a-f]{24}\nアリス: 部屋は空いてる？\nPLAYER-[0-9a-f]{24}>>$/);
   assert.ok(!JSON.stringify(s.logs).includes('部屋は空いてる'), 'no message text in logs');
   // The exchange goes to Minato's memory of Alice only.
   assert.deepEqual(s.memory.recorded.map((r) => [r.key.npcId, r.key.pcId]), [['minato', 'pc-alice']]);
