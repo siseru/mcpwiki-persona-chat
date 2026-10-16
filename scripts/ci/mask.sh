@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Registers environment-specific values with the GitHub Actions log masker (run first in every job that
 # handles them). "::add-mask::" lines are consumed by the runner and never displayed; afterwards every
-# occurrence of the value in logs is shown as ***. Sources: AWS_ACCOUNT_ID, ALARM_EMAIL, REDACT_EXTRA
+# occurrence of the value in logs is shown as ***. Sources: AWS_ACCOUNT_ID, ALARM_EMAIL, PERSONACHAT_WIKI (JSON), REDACT_EXTRA
 # (comma-separated values or URLs; for URLs the host is masked, e.g. the wiki and WebSocket endpoints).
 # See scripts/ci/redact.mjs for redacting piped output.
 set -euo pipefail
@@ -14,6 +14,10 @@ mask "${AWS_ACCOUNT_ID:-}"
 mask "${ALARM_EMAIL:-}"
 # ... and with punctuation dropped (the form CDK's EmailSubscription used in logical ids).
 mask "$(printf '%s' "${ALARM_EMAIL:-}" | tr -cd 'A-Za-z0-9')"
+# The wiki each environment plugs into: distribution ARNs and their ids.
+if [ -n "${PERSONACHAT_WIKI:-}" ]; then
+  while IFS= read -r v; do mask "$v"; mask "${v##*/}"; done < <(jq -r '[.[]?.distributionArn // empty] | .[]' <<< "$PERSONACHAT_WIKI")
+fi
 IFS=',' read -ra extras <<< "${REDACT_EXTRA:-}"
 for v in "${extras[@]}"; do
   v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"

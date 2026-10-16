@@ -24,6 +24,19 @@ for (const item of (process.env.REDACT_EXTRA ?? '').split(',')) {
   }
 }
 
+// The wiki each environment plugs into (PERSONACHAT_WIKI): distribution ARNs and ids.
+try {
+  for (const w of Object.values(JSON.parse(process.env.PERSONACHAT_WIKI || '{}') ?? {})) {
+    const arn = w?.distributionArn;
+    if (typeof arn === 'string') {
+      add(arn);
+      add(arn.slice(arn.lastIndexOf('/') + 1));
+    }
+  }
+} catch {
+  console.error('redact: PERSONACHAT_WIKI is not valid JSON; only generic patterns are applied');
+}
+
 // Identifiers created at deploy time (not known in advance). Each log line is split into tokens and every
 // token is tested against fully anchored patterns (no partial matches inside unrelated words or URLs).
 const TOKEN_PATTERNS = [
@@ -32,6 +45,8 @@ const TOKEN_PATTERNS = [
   /^d[a-z0-9]{8,16}\.cloudfront\.net$/, // CloudFront distribution domain
   /^[a-z0-9]{10}\.execute-api\.[a-z0-9-]+\.amazonaws\.com$/, // API Gateway endpoint (HTTP and WebSocket)
   /^Z[A-Z0-9]{8,32}$/, // Route 53 hosted zone id
+  /^E[A-Z0-9]{12,14}$/, // CloudFront distribution id
+  /^[a-z0-9.-]+\.s3\.[a-z0-9-]+\.amazonaws\.com$/, // S3 bucket (regional) domain
 ];
 const TOKEN = /[A-Za-z0-9_.-]+/g;
 
