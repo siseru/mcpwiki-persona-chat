@@ -21,3 +21,12 @@ skip-check:
   - CKV_AWS_116
   - CKV_AWS_117
   - CKV_AWS_173
+  # Log groups use the CloudWatch Logs default encryption (AWS-owned keys), as in MCPWiki: no secrets or message
+  # text are logged, and a customer-managed key adds cost without a sharing need.
+  - CKV_AWS_158
+  # The state table only holds 30-second tickets and live connections (src/infra/extension-stack.ts): nothing
+  # to recover from a backup.
+  - CKV_AWS_165
+  # WebSocket access logging needs the account-wide API Gateway CloudWatch role, which this stack does not own;
+  # the route function logs connect / disconnect instead. The HTTP ticket API has access logs.
+  - CKV_AWS_95
