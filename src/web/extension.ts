@@ -130,16 +130,30 @@ interface Draft {
   secrets: (DraftField & { reveal: { afterVisits: number } })[];
 }
 
-const basisNote = (f: DraftField) =>
-  text('small', f.basis.kind === 'article' ? `記事に基づく:「${f.basis.quote}」` : '補った設定（記事にはありません）', f.basis.kind === 'article' ? 'muted' : 'invented');
+/** Markdown links read as their text in a quote: "[ミナト](/wiki/minato)" -> "ミナト". */
+const plainQuote = (q: string) => q.replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1');
 
-function input(label: string, value: string, opts: { multiline?: boolean; note?: HTMLElement } = {}) {
-  const box = document.createElement('label');
-  box.className = 'field';
+/**
+ * Layout through the CSSOM: the wiki's CSP allows no inline style attributes or <style> elements, and the wiki's
+ * stylesheet knows nothing about this form.
+ */
+const css = (el: HTMLElement, s: Partial<CSSStyleDeclaration>) => (Object.assign(el.style, s), el);
+
+const basisNote = (f: DraftField) =>
+  css(text('small', f.basis.kind === 'article' ? `記事に基づく:「${plainQuote(f.basis.quote)}」` : '補った設定（記事にはありません）', 'muted'), {
+    display: 'block',
+    marginTop: '0.2rem',
+    ...(f.basis.kind === 'invented' ? { fontStyle: 'italic' } : {}),
+  });
+
+function input(label: string, value: string, opts: { multiline?: boolean; rows?: number; note?: HTMLElement } = {}) {
+  const box = css(document.createElement('label'), { display: 'block', margin: '0 0 0.9rem' });
   const el = document.createElement(opts.multiline ? 'textarea' : 'input') as HTMLInputElement | HTMLTextAreaElement;
   el.value = value;
-  if (opts.multiline) (el as HTMLTextAreaElement).rows = 3;
-  box.append(text('span', label), el);
+  css(el, { display: 'block', width: '100%', boxSizing: 'border-box', marginTop: '0.25rem' });
+  // The wiki's stylesheet gives every textarea the editor's large minimum height: size these by rows instead.
+  if (opts.multiline) css(el, { minHeight: '0', height: `${(opts.rows ?? 3) * 1.6 + 1}em`, resize: 'vertical' });
+  box.append(css(text('span', label), { fontWeight: '600' }), el);
   if (opts.note) box.append(opts.note);
   return { box, get: () => el.value.trim() };
 }
@@ -171,19 +185,21 @@ function draftPanel(ctx: HostContext, el: HTMLElement) {
 }
 
 function draftForm(ctx: HostContext, d: Draft): HTMLElement {
-  const form = document.createElement('div');
-  form.className = 'npc-draft';
+  const form = css(document.createElement('div'), { marginTop: '1rem', maxWidth: '48rem' });
   const id = input('新しい記事の ID（英小文字・数字・-）', '');
   const title = input('記事のタイトル', d.name.value);
   const name = input('名前', d.name.value, { note: basisNote(d.name) });
   const role = input('役割', d.role.value, { note: basisNote(d.role) });
-  const persona = input('人格', d.persona.value, { multiline: true, note: basisNote(d.persona) });
+  const persona = input('人格', d.persona.value, { multiline: true, rows: 4, note: basisNote(d.persona) });
   const voice = input('口調', d.voice.value, { note: basisNote(d.voice) });
   const greeting = input('挨拶', d.greeting.value, { note: basisNote(d.greeting) });
   const knowledgeNotes = document.createElement('div');
-  for (const k of d.knowledge) knowledgeNotes.append(document.createElement('br'), basisNote(k));
-  const knowledge = input('知っていること（1 行に 1 つ）', d.knowledge.map((k) => k.value).join('\n'), { multiline: true, note: knowledgeNotes });
-  const background = input('背景（記事の本文になります）', '', { multiline: true });
+  for (const k of d.knowledge) {
+    const why = k.basis.kind === 'article' ? `記事に基づく:「${plainQuote(k.basis.quote)}」` : '補った設定（記事にはありません）';
+    knowledgeNotes.append(css(text('small', `・${k.value} — ${why}`, 'muted'), { display: 'block', marginTop: '0.2rem' }));
+  }
+  const knowledge = input('知っていること（1 行に 1 つ）', d.knowledge.map((k) => k.value).join('\n'), { multiline: true, rows: Math.max(3, d.knowledge.length + 1), note: knowledgeNotes });
+  const background = input('背景（記事の本文になります）', '', { multiline: true, rows: 5 });
   const secrets = d.secrets.map((s, i) => {
     const keep = document.createElement('input');
     keep.type = 'checkbox';
@@ -192,9 +208,9 @@ function draftForm(ctx: HostContext, d: Draft): HTMLElement {
     visits.min = '1';
     visits.max = '100';
     visits.value = String(s.reveal.afterVisits);
-    const t = input(`秘密の候補 ${i + 1}（採用するものだけ「残す」に印を付けます）`, s.value, { multiline: true, note: basisNote(s) });
-    const row = document.createElement('div');
-    row.className = 'secret';
+    const t = input(`秘密の候補 ${i + 1}（採用するものだけ「残す」に印を付けます）`, s.value, { multiline: true, rows: 2, note: basisNote(s) });
+    const row = css(document.createElement('div'), { border: '1px solid currentColor', borderRadius: '6px', padding: '0.6rem', margin: '0 0 0.9rem', opacity: '0.95' });
+    css(visits, { width: '4.5rem' });
     const keepLabel = document.createElement('label');
     keepLabel.append(keep, ' 残す');
     const visitsLabel = document.createElement('label');
