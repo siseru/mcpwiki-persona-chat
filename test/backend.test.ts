@@ -507,6 +507,7 @@ test('the NPC recalls what it remembers about this PC, and every exchange is rec
   const system = s.chatCalls[0]!.system;
   // Remembered, fenced as untrusted notes, with "the user" mapped to the PC; nothing from another PC.
   assert.match(system, /What ミナト remembers about アリス from earlier visits/);
+  assert.match(system, /mention only what the notes above say; never make up past events/);
   assert.match(system, /<<PLAYER-[0-9a-f]{24}\n- ユーザーは祭りまでに竜の鱗を持ってくると約束した\nPLAYER-[0-9a-f]{24}>>/);
   assert.ok(!system.includes('ボブ'));
   assert.equal(s.memory.recorded.length, 1);
