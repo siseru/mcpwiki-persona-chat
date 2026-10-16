@@ -38,8 +38,15 @@ jobs:
           python3 - <<'PY'
           import glob, json, sys
           # Reviewed exceptions, pinned to one result: (rule, file, CodeQL's primaryLocationLineHash). An edit
-          # around the reviewed line changes the key and fails the gate until it is reviewed again. None yet.
-          allowed = set()
+          # around the reviewed line changes the key and fails the gate until it is reviewed again. Each is still
+          # printed as a notice, so it cannot rot silently.
+          #
+          # js/http-to-file-access, scripts/supply-chain/review-lockfile.mjs: the lockfile review appends its report
+          # to GITHUB_STEP_SUMMARY, and the report contains npm registry metadata. Every untrusted value goes
+          # through mdCell() (escapes |, \, <, >, backticks and newlines) and is cut to 300 characters; the
+          # summary is rendered as Markdown by GitHub, never executed. MCPWiki excludes the rule repo-wide for
+          # this script; here only this one result is accepted. Reviewed 2026-10.
+          allowed = {('js/http-to-file-access', 'scripts/supply-chain/review-lockfile.mjs', 'e9164eafd583b2e7:1')}
           results = [r for f in glob.glob('codeql-results/*.sarif') for run in json.load(open(f, encoding='utf-8'))['runs'] for r in run.get('results', [])]
           failures = []
           for r in results:
