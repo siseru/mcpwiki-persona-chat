@@ -37,3 +37,43 @@ node scripts/bootstrap-dev.mjs
 - dev で Bedrock を使うときは、モデルの ID（ワイルドカード可）を `cdk.json` の `devBedrockModels` に書き、ガードを配備し直します。例: `["anthropic.claude-haiku-5-5"]`。us-west-2 の Anthropic モデルは推論プロファイル経由でしか呼べません（[docs/spike.md](spike.md)）。基盤モデル（全リージョン）と、US の推論プロファイル（`us.<ID>`）の両方が許可されます。
 - Bedrock の Anthropic モデルは、アカウントで 1 回、利用目的の申請が必要です。境界はこの申請を dev に許さないので、管理者がコンソールから行います。
 - prod は、既定の bootstrap（MCPWiki の prod と同じもの）を使います。
+
+## 拡張のスタック（dev）
+
+拡張のスタック `PersonaChat-dev` は、ガードと dev 用の bootstrap の後に配備します。今は、バンドルを置くバケットだけのスタックです。MCPWiki の配信が、このバケットの `ext/persona-chat/*` を OAC で読みます（MCPWiki の docs/extensions.md）。
+
+2 つのスタックは、CloudFormation の参照でつなぎません。互いの値は設定として渡します。
+
+| 向き | 値 | 置き場所 |
+|---|---|---|
+| MCPWiki から拡張へ | MCPWiki の配信の ARN | `config/wiki.local.json`（Git の管理外）。CI ではシークレット `PERSONACHAT_WIKI` |
+| 拡張から MCPWiki へ | バケットのドメイン、バンドルのファイル名、SRI | MCPWiki のシークレット `MCPWIKI_EXTENSIONS` |
+
+```bash
+# 1. MCPWiki の dev の配信の ARN を、Git の管理外のファイルに書く
+D=$(aws cloudformation describe-stack-resource --region us-west-2 --stack-name MCPWiki-dev --logical-resource-id Cdn9963B1AD --query StackResourceDetail.PhysicalResourceId --output text)
+A=$(aws sts get-caller-identity --query Account --output text)
+printf '{"dev":{"distributionArn":"arn:aws:cloudfront::%s:distribution/%s"}}\n' "$A" "$D" > config/wiki.local.json
+
+# 2. バンドルを作り、拡張のスタックを配備する（境界つきの pcdev の bootstrap を使う）
+npm run deploy:dev
+
+# 3. MCPWiki に渡す値（バケットのドメインは、スタックの出力 BundleBucketDomain）
+cat dist/bundle.json
+```
+
+続けて、MCPWiki のシークレット `MCPWIKI_EXTENSIONS` を、次の形で設定します。設定したら、MCPWiki の Deploy ワークフローを、main で実行し直します（Actions の画面の「Run workflow」）。
+
+```json
+{"dev":[{"id":"persona-chat","contract":1,"bucketRegionalDomainName":"<BundleBucketDomain>","script":"<bundle.json の script>","integrity":"<bundle.json の integrity>","connectSrc":[]}]}
+```
+
+**外すとき**
+1. MCPWiki の `MCPWIKI_EXTENSIONS` から、persona-chat の項目を消します。
+2. MCPWiki を配備し直します。
+3. `npx cdk destroy PersonaChat-dev` を実行します。
+
+**バンドルを更新するとき**
+1. `npm run deploy:dev` を実行します。古いバンドルも、バケットに残ります。
+2. MCPWiki の `MCPWIKI_EXTENSIONS` の `script` と `integrity` を、新しい `dist/bundle.json` の値に書き換えます。
+3. MCPWiki を配備し直します。

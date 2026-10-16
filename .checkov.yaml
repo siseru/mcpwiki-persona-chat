@@ -9,3 +9,15 @@ skip-check:
   # allowlist and the denies carve out everything else); see src/infra/guard-stack.ts.
   - CKV_AWS_111
   - CKV_AWS_109
+  # Bundle bucket (src/infra/extension-stack.ts): bundles are rebuilt from this repository on every deploy, so
+  # versioning adds nothing; they are read only through the wiki's CloudFront distribution, whose logs cover
+  # every read.
+  - CKV_AWS_21
+  - CKV_AWS_18
+  # CDK-managed custom resources (BucketDeployment, autoDeleteObjects): deploy-time only, invoked by
+  # CloudFormation (no async invocations to dead-letter, no concurrency to cap, nothing private to reach in a
+  # VPC, no secrets in their environment).
+  - CKV_AWS_115
+  - CKV_AWS_116
+  - CKV_AWS_117
+  - CKV_AWS_173

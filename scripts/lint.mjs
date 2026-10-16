@@ -61,7 +61,7 @@ for (const f of readdirSync(wfDir).filter((f) => /\.ya?ml$/.test(f))) {
 // can be registered, and only secrets are redacted there (a vars.* value would appear in public logs).
 for (const f of readdirSync(wfDir).filter((f) => /\.ya?ml$/.test(f))) {
   readFileSync(join(wfDir, f), 'utf8').split('\n').forEach((line, i) => {
-    const m = /vars\.(AWS_ACCOUNT_ID|AWS_DEPLOY_ROLE_ARN|ALARM_EMAIL|WIKI_URL|DEV_URL|\w*(ENDPOINT|DOMAIN|HOST|URL)\w*)\b/.exec(line);
+    const m = /vars\.(AWS_ACCOUNT_ID|AWS_DEPLOY_ROLE_ARN|ALARM_EMAIL|PERSONACHAT_WIKI|WIKI_URL|DEV_URL|\w*(ENDPOINT|DOMAIN|HOST|URL)\w*)\b/.exec(line);
     if (m) violations.push(`.github/workflows/${f}:${i + 1}: use secrets.${m[1]} (vars are printed unmasked in public logs)`);
   });
 }

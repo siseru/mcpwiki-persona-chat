@@ -13,11 +13,14 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build:ts": "tsc -p tsconfig.json",
+    "build:bundle": "node scripts/build-bundle.mjs",
+    "build": "npm run build:ts && npm run build:bundle",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "node scripts/lint.mjs",
     "test": "npm run build && node --test build/test/*.test.js",
-    "synth": "npm run build && cdk synth --quiet"
+    "synth": "npm run build && cdk synth --quiet",
+    "deploy:dev": "npm run build && cdk deploy PersonaChat-dev"
   },
   "devDependencies": {
     "@types/node": "^24.19.1",
