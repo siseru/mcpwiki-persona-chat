@@ -1,0 +1,11 @@
+# checkov configuration for the synthesized CloudFormation templates (cdk.out).
+# Every skip carries the reason; anything not listed here fails the "Security / iac" job.
+framework:
+  - cloudformation
+quiet: true
+compact: true
+skip-check:
+  # Flagged on the dev permissions boundary (an upper bound, not a grant: the allow set is the service
+  # allowlist and the denies carve out everything else); see src/infra/guard-stack.ts.
+  - CKV_AWS_111
+  - CKV_AWS_109

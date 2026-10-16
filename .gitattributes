@@ -1,0 +1,4 @@
+# Keep LF in the working tree on every platform. Generated files (src/backend/seed/pages.generated.ts)
+# and the shell scripts under scripts/ are compared and run byte for byte, so a CRLF checkout on Windows
+# would make them look out of date or fail to execute.
+* text=auto eol=lf

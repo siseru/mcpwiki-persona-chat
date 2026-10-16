@@ -1,0 +1,5 @@
+# All changes are reviewed by the maintainer. Security-sensitive areas are listed explicitly.
+*                @siseru
+/src/infra/      @siseru
+/.github/        @siseru
+/scripts/        @siseru

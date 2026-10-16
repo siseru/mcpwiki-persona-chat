@@ -1,0 +1,82 @@
+name: Supply chain
+
+# Runs on every PR that changes dependencies (typically Dependabot). Nothing here has cloud credentials
+# or secrets: dependency code is executed only in this unprivileged context.
+# Human-review gates are PR labels; adding a label re-runs the checks:
+#   supply-chain-reviewed   accept registry findings (age / install scripts / provenance / source)
+#   runtime-deps-reviewed   accept a runtime (browser/Lambda) dependency change after reading its diff artifact
+#   infra-diff-reviewed     accept security-relevant changes in synthesized CloudFormation
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - package.json
+      - package-lock.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lockfile:
+    name: Lockfile review (registry metadata, provenance, runtime diffs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Review new package versions
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: node scripts/supply-chain/review-lockfile.mjs "origin/${BASE_REF}" package-lock.json
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: supply-chain-report
+          path: supply-chain-report/
+          if-no-files-found: ignore
+
+  infra-diff:
+    name: Infrastructure diff (base vs PR synth)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CDK_DEFAULT_ACCOUNT: '123456789012'
+      CDK_DEFAULT_REGION: us-west-2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Synthesize base and PR (no install scripts, no credentials)
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
+        run: |
+          git worktree add ../base "origin/${BASE_REF}"
+          # The very first PR adds the project itself: an empty base synthesizes nothing.
+          dirs="../base ."
+          if [ ! -f ../base/package.json ]; then echo "base has no package.json: comparing against an empty assembly"; dirs="."; mkdir -p ../base/cdk.out.synth; fi
+          for dir in $dirs; do
+            (cd "$dir" && npm ci --ignore-scripts && npm run build && npx cdk synth --quiet -o cdk.out.synth)
+          done
+      - name: Compare (strict for dependency-only changes)
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          changed=$(git diff --name-only "origin/${BASE_REF}...HEAD")
+          strict=""
+          if ! echo "$changed" | grep -qvE '^(package\.json|package-lock\.json)$'; then strict="--strict"; fi
+          echo "changed files:"; echo "$changed"; echo "mode: ${strict:-report}"
+          node scripts/supply-chain/template-diff.mjs ../base/cdk.out.synth cdk.out.synth $strict

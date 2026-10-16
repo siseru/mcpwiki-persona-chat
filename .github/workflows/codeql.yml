@@ -1,0 +1,61 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read # required by codeql-action on private repositories
+      contents: read
+      security-events: write
+    strategy:
+      matrix:
+        language: [javascript-typescript, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: ${{ matrix.language }}
+          config-file: ./.github/codeql/codeql-config.yml
+      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          # Uploading to code scanning needs a public repo or GitHub Code Security (CODE_SCANNING_ENABLED=true).
+          upload: ${{ vars.CODE_SCANNING_ENABLED == 'true' && 'always' || 'never' }}
+          output: codeql-results
+      - name: Fail on CodeQL findings
+        run: |
+          python3 - <<'PY'
+          import glob, json, sys
+          # Reviewed exceptions, pinned to one result: (rule, file, CodeQL's primaryLocationLineHash). An edit
+          # around the reviewed line changes the key and fails the gate until it is reviewed again. None yet.
+          allowed = set()
+          results = [r for f in glob.glob('codeql-results/*.sarif') for run in json.load(open(f, encoding='utf-8'))['runs'] for r in run.get('results', [])]
+          failures = []
+          for r in results:
+              loc = r['locations'][0]['physicalLocation']
+              uri, line = loc['artifactLocation']['uri'], loc.get('region', {}).get('startLine', 1)
+              key = (r['ruleId'], uri, r.get('partialFingerprints', {}).get('primaryLocationLineHash'))
+              kind = 'notice' if key in allowed or r.get('suppressions') else 'error'
+              if kind == 'error':
+                  failures.append(r)
+              print(f"::{kind} file={uri},line={line}::{r['ruleId']} [{key[2]}]: {r['message']['text']}")
+          print(f"{len(results)} CodeQL finding(s), {len(failures)} not reviewed")
+          sys.exit(1 if failures else 0)
+          PY
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: codeql-${{ matrix.language }}
+          path: codeql-results/
+          if-no-files-found: ignore
