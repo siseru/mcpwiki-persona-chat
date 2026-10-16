@@ -116,25 +116,26 @@ export class ExtensionStack extends Stack {
     // Drafts wait for the model: just under the HTTP API's 30 s integration limit.
     const httpFn = fn('HttpFn', 'http', 'HTTP API (tickets, facilities, drafts)', Duration.seconds(29));
     const authorizerFn = fn('AuthorizerFn', 'authorize', 'WebSocket $connect authorizer');
-    const wsFn = fn('WsFn', 'ws', 'WebSocket routes');
+    // Replies stream from the model: just under the WebSocket integration's 29 s limit.
+    const wsFn = fn('WsFn', 'ws', 'WebSocket routes (conversations)', Duration.seconds(28));
     // Least privilege: tickets are written by one function and consumed by another; connections by the routes; only
     // the HTTP function touches the catalog.
     httpFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:PutItem', 'dynamodb:UpdateItem'], resources: [table.tableArn] })); // tickets, draft budgets
     // Drafts: this one model only, through its US inference profile.
     if (!/^us\.[a-z0-9.:-]+$/.test(props.draftModel)) throw new Error('draftModel must be a "us." inference profile id');
     const foundationModel = props.draftModel.slice('us.'.length);
-    httpFn.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ['bedrock:InvokeModel'],
-        resources: [
-          `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/${props.draftModel}`,
-          ...US_PROFILE_REGIONS.map((r) => `arn:aws:bedrock:${r}::foundation-model/${foundationModel}`),
-        ],
-      }),
-    );
+    const modelArns = [
+      `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/${props.draftModel}`,
+      ...US_PROFILE_REGIONS.map((r) => `arn:aws:bedrock:${r}::foundation-model/${foundationModel}`),
+    ];
+    httpFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['bedrock:InvokeModel'], resources: modelArns }));
+    // Conversations: the same model, streamed.
+    wsFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['bedrock:InvokeModelWithResponseStream'], resources: modelArns }));
     httpFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:DeleteItem', 'dynamodb:Scan'], resources: [catalog.tableArn] }));
     authorizerFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:DeleteItem'], resources: [table.tableArn] }));
-    wsFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:DeleteItem'], resources: [table.tableArn] }));
+    // Connections, conversation logs and chat budgets; published snapshots are read only.
+    wsFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:DeleteItem', 'dynamodb:UpdateItem'], resources: [table.tableArn] }));
+    wsFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:GetItem'], resources: [catalog.tableArn] }));
 
     // ---------------------------------------------------------------- APIs
     const http = new apigw.HttpApi(this, 'TicketApi', {

@@ -2,11 +2,12 @@
 // Lambda runtime). Configuration: WIKI_ORIGIN, ISSUER, CLIENT_ID, TABLE (tickets, connections, budgets), CATALOG
 // (publications), MODEL_ID (Bedrock inference profile for drafts).
 import { ApiGatewayManagementApiClient, DeleteConnectionCommand, GoneException, PostToConnectionCommand } from '@aws-sdk/client-apigatewaymanagementapi';
-import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-runtime';
+import { BedrockRuntimeClient, ConverseCommand, ConverseStreamCommand } from '@aws-sdk/client-bedrock-runtime';
 import { ConditionalCheckFailedException, DeleteItemCommand, DynamoDBClient, GetItemCommand, PutItemCommand, ScanCommand, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
 import type { Publication } from './catalog.js';
+import type { ChatProvider, Turn } from './chat.js';
 import { DraftError, type LlmProvider } from './draft.js';
-import { handleAdopt, handleAuthorize, handleConnect, handleDisconnect, handleDraft, handleList, handleMessage, handlePublish, handleTicket, handleUnpublish, type Budget, type CatalogStore, type Connection, type ConnectionStore, type Deps, type HttpRequest, type HttpResult } from './handlers.js';
+import { handleAdopt, handleAuthorize, handleConnect, handleDisconnect, handleDraft, handleList, handleMessage, handlePublish, handleTicket, handleUnpublish, type Budget, type CatalogStore, type ConversationStore, type Connection, type ConnectionStore, type Deps, type HttpRequest, type HttpResult } from './handlers.js';
 import { TokenVerifier } from './jwt.js';
 import type { Identity, TicketStore } from './tickets.js';
 
@@ -103,7 +104,43 @@ const budget: Budget = {
   },
 };
 
+const conversations: ConversationStore = {
+  async get(id) {
+    const r = await db.send(new GetItemCommand({ TableName: TABLE, Key: { pk: { S: `conv#${id}` } }, ConsistentRead: true }));
+    return r.Item?.turns?.S ? (JSON.parse(r.Item.turns.S) as Turn[]) : [];
+  },
+  async put(id, turns, expiresAt) {
+    await db.send(new PutItemCommand({ TableName: TABLE, Item: { pk: { S: `conv#${id}` }, turns: { S: JSON.stringify(turns.slice(-40)) }, ttl: { N: String(expiresAt) } } }));
+  },
+};
+
 const bedrock = new BedrockRuntimeClient({});
+const chat: ChatProvider = {
+  async chat({ system, messages, maxTokens, onDelta }) {
+    const r = await bedrock.send(
+      new ConverseStreamCommand({
+        modelId: env('MODEL_ID'),
+        system: [{ text: system }],
+        // Bedrock wants the conversation to start with the user: a leading greeting becomes context instead.
+        messages: (messages[0]?.role === 'assistant' ? messages.slice(1) : messages).map((m) => ({ role: m.role, content: [{ text: m.text }] })),
+        inferenceConfig: { maxTokens },
+      }),
+      { abortSignal: AbortSignal.timeout(25_000) },
+    );
+    let text = '';
+    let inputTokens = 0;
+    let outputTokens = 0;
+    for await (const ev of r.stream ?? []) {
+      const delta = ev.contentBlockDelta?.delta?.text;
+      if (delta) {
+        text += delta;
+        await onDelta(delta);
+      }
+      if (ev.metadata?.usage) ({ inputTokens = 0, outputTokens = 0 } = ev.metadata.usage);
+    }
+    return { text, inputTokens, outputTokens };
+  },
+};
 const llm: LlmProvider = {
   async draft({ system, user, tool, maxTokens }) {
     const r = await bedrock.send(
@@ -163,6 +200,8 @@ const deps = (ws?: { domainName: string; stage: string }): Deps => ({
   fetchArticle: (token, id) => wikiGet(token, `/api/articles/${encodeURIComponent(id)}`),
   createArticle: (token, input) => wikiSend(token, 'POST', '/api/articles', input),
   llm,
+  chat,
+  conversations,
   budget,
   send: async (connectionId, data) => {
     try {
@@ -210,7 +249,8 @@ export async function authorize(event: { methodArn: string; headers?: Record<str
   return {
     principalId: identity.sub,
     policyDocument: { Version: '2012-10-17', Statement: [{ Action: 'execute-api:Invoke', Effect: 'Allow', Resource: event.methodArn }] },
-    context: { sub: identity.sub, username: identity.username, role: identity.role },
+    // Authorizer context values must be strings.
+    context: { sub: identity.sub, username: identity.username, role: identity.role, session: identity.session ? JSON.stringify(identity.session) : '' },
   };
 }
 
@@ -225,7 +265,7 @@ export async function ws(event: WsEvent) {
   const d = deps(ctx);
   if (ctx.routeKey === '$connect') {
     const a = ctx.authorizer ?? {};
-    await handleConnect(d, ctx.connectionId, { sub: a.sub!, username: a.username!, role: a.role as Identity['role'] });
+    await handleConnect(d, ctx.connectionId, { sub: a.sub!, username: a.username!, role: a.role as Identity['role'], ...(a.session ? { session: JSON.parse(a.session) } : {}) });
   } else if (ctx.routeKey === '$disconnect') {
     await handleDisconnect(d, ctx.connectionId);
   } else {

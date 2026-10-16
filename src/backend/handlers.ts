@@ -1,9 +1,10 @@
 // Request handling, independent of AWS (the Lambda entry points in index.ts wire in DynamoDB, the API Gateway
 // management API and fetch). Never logs tokens, tickets or message text.
 import { ARTICLE_ID_RE, parseFacility, parseNpc, publicView, SchemaError, sourceVersions, type Publication, type WikiArticle } from './catalog.js';
+import { buildChat, clean, cleanReply, MAX_REPLY_CHARS, MAX_SAY_CHARS, type ChatProvider, type Turn } from './chat.js';
 import { buildPrompt, DRAFT_TOOL, DraftError, parseDraft, type LlmProvider } from './draft.js';
 import { AuthError, type TokenVerifier } from './jwt.js';
-import { issueTicket, MAX_CONNECTION_SEC, redeemTicket, type Identity, type TicketStore } from './tickets.js';
+import { issueTicket, MAX_CONNECTION_SEC, redeemTicket, type Identity, type Session, type TicketStore } from './tickets.js';
 
 export interface Connection extends Identity {
   connectedAt: number;
@@ -20,6 +21,11 @@ export interface CatalogStore {
   put(id: string, publication: Publication, versions: string): Promise<void>;
   delete(id: string): Promise<void>;
   list(): Promise<Publication[]>;
+}
+
+export interface ConversationStore {
+  get(connectionId: string): Promise<Turn[]>;
+  put(connectionId: string, turns: Turn[], expiresAt: number): Promise<void>;
 }
 
 export interface Budget {
@@ -41,6 +47,8 @@ export interface Deps {
   /** POST <wiki>/api/articles with the user's token: the wiki decides what the user may create. */
   createArticle: (token: string, input: Record<string, unknown>) => Promise<{ status: number; body: unknown }>;
   llm: LlmProvider;
+  chat: ChatProvider;
+  conversations: ConversationStore;
   budget: Budget;
   send: (connectionId: string, data: unknown) => Promise<void>;
   close: (connectionId: string) => Promise<void>;
@@ -90,11 +98,35 @@ async function authenticate(d: Deps, req: HttpRequest): Promise<{ identity: Iden
 }
 const failed = (r: Awaited<ReturnType<typeof authenticate>>): r is HttpResult => 'status' in r;
 
-/** POST /ticket with "Authorization: Bearer <access token>" from the wiki's page. */
+/**
+ * POST /ticket with "Authorization: Bearer <access token>" from the wiki's page. With a body
+ * { facilityId, npcId, pcId } the ticket enters that facility: it must be published, the NPC must be one of its
+ * NPCs, and the PC must be an article of type PC owned by the user (checked with the user's own token).
+ */
 export async function handleTicket(d: Deps, req: HttpRequest): Promise<HttpResult> {
   const auth = await authenticate(d, req);
   if (failed(auth)) return auth;
-  const { identity } = auth;
+  const identity: Identity = { ...auth.identity };
+  if (req.body) {
+    let x: { facilityId?: unknown; npcId?: unknown; pcId?: unknown };
+    try {
+      x = JSON.parse(req.body);
+    } catch {
+      return { status: 400, body: { error: 'bad_request' } };
+    }
+    const ids = [x.facilityId, x.npcId, x.pcId];
+    if (!ids.every((v) => typeof v === 'string' && ARTICLE_ID_RE.test(v))) return { status: 400, body: { error: 'bad_request', message: 'facilityId, npcId and pcId must be article ids' } };
+    const [facilityId, npcId, pcId] = ids as string[];
+    const pub = await d.catalog.get(facilityId!);
+    if (!pub) return { status: 404, body: { error: 'not_published' } };
+    if (!pub.publication.facility.npcs.includes(npcId!)) return { status: 400, body: { error: 'npc_not_here' } };
+    const pc = await readArticle(d, auth.token, pcId!);
+    if ('error' in pc) return pc.error;
+    // MCPWiki does not expose the owner's id; usernames are immutable, so the owner's name identifies them.
+    const owner = (pc.article as WikiArticle & { ownerName?: unknown }).ownerName;
+    if (pc.article.type !== 'PC' || owner !== identity.username) return { status: 403, body: { error: 'not_your_pc', message: 'choose a PC article (type PC) that you own' } };
+    identity.session = { facilityId: facilityId!, npcId: npcId!, pcId: pcId!, pcName: clean(pc.article.title).slice(0, 60) || pcId! };
+  }
   const { ticket, expiresAt } = await issueTicket(d.tickets, identity, d.now());
   d.log({ msg: 'connection pass issued', sub: identity.sub });
   return { status: 200, body: { ticket, expiresAt, maxConnectionSec: MAX_CONNECTION_SEC } };
@@ -282,7 +314,67 @@ export async function handleDisconnect(d: Deps, connectionId: string): Promise<v
   d.log({ msg: 'disconnected', connectionId });
 }
 
-/** $default route: { "type": "ping", "t": <client time> } -> { "type": "pong", ... }. */
+/** Conversation logs live a week (TTL), long enough for the DM to look at them, then they are gone. */
+export const CONVERSATION_TTL_SEC = 7 * 86400;
+/** Lines per user and UTC day, and per connection per 3 seconds (each is a Bedrock call). */
+export const SAYS_PER_DAY = 300;
+
+async function npcFor(d: Deps, s: Session) {
+  const pub = await d.catalog.get(s.facilityId);
+  const npc = pub?.publication.npcs.find((n) => n.id === s.npcId);
+  return pub && npc ? { facility: pub.publication.facility, npc } : null;
+}
+
+/** { "type": "hello" } after connecting: the NPC's greeting (from the snapshot, not the model). */
+async function hello(d: Deps, connectionId: string, c: Connection) {
+  if (!c.session) return d.send(connectionId, { type: 'error', code: 'no_session' });
+  const found = await npcFor(d, c.session);
+  if (!found) return d.send(connectionId, { type: 'error', code: 'not_published' });
+  const greeting = found.npc.greeting || '……';
+  const turns = await d.conversations.get(connectionId);
+  if (!turns.length) await d.conversations.put(connectionId, [{ role: 'assistant', text: greeting }], d.now() + CONVERSATION_TTL_SEC);
+  return d.send(connectionId, { type: 'npc', npc: { id: found.npc.id, name: found.npc.name, role: found.npc.role }, facility: found.facility.title, text: greeting });
+}
+
+/** { "type": "say", "text": "..." }: one line from the PC; the NPC's reply is streamed as "delta" messages. */
+async function say(d: Deps, connectionId: string, c: Connection, raw: unknown) {
+  if (!c.session) return d.send(connectionId, { type: 'error', code: 'no_session' });
+  const text = typeof raw === 'string' ? clean(raw) : '';
+  if (!text || text.length > MAX_SAY_CHARS) return d.send(connectionId, { type: 'error', code: 'bad_text', max: MAX_SAY_CHARS });
+  const now = d.now();
+  if (!(await d.budget.take(`rate#conn#${connectionId}#${Math.floor(now / 3)}`, 1, 60))) return d.send(connectionId, { type: 'error', code: 'too_fast' });
+  const day = new Date(now * 1000).toISOString().slice(0, 10);
+  if (!(await d.budget.take(`budget#chat#${c.sub}#${day}`, SAYS_PER_DAY, 2 * 86400))) return d.send(connectionId, { type: 'error', code: 'budget_exceeded' });
+  const found = await npcFor(d, c.session);
+  if (!found) return d.send(connectionId, { type: 'error', code: 'not_published' });
+  const history = [...(await d.conversations.get(connectionId)), { role: 'user' as const, text }];
+  const { system, messages, boundary } = buildChat(found.facility, found.npc, c.session.pcName, history);
+  await d.send(connectionId, { type: 'start' });
+  let reply: string;
+  try {
+    let sent = 0;
+    const r = await d.chat.chat({
+      system,
+      messages,
+      maxTokens: 400,
+      // Deltas are sent as they come, but never past the reply cap; the final text is cleaned once more.
+      onDelta: async (delta) => {
+        const piece = delta.split(boundary).join('').slice(0, Math.max(0, MAX_REPLY_CHARS - sent));
+        sent += piece.length;
+        if (piece) await d.send(connectionId, { type: 'delta', text: piece });
+      },
+    });
+    reply = cleanReply(r.text, boundary);
+    d.log({ msg: 'said', sub: c.sub, facility: c.session.facilityId, npc: c.session.npcId, inputTokens: r.inputTokens, outputTokens: r.outputTokens });
+  } catch (e) {
+    d.log({ msg: 'model error', sub: c.sub, error: e instanceof Error ? e.name : 'unknown' });
+    return d.send(connectionId, { type: 'error', code: 'model_unavailable' });
+  }
+  await d.conversations.put(connectionId, [...history, { role: 'assistant', text: reply || '……' }], now + CONVERSATION_TTL_SEC);
+  return d.send(connectionId, { type: 'done', text: reply });
+}
+
+/** $default route: ping / hello / say (JSON, at most 4 KB). */
 export async function handleMessage(d: Deps, connectionId: string, raw: string | undefined): Promise<void> {
   const c = await d.connections.get(connectionId);
   if (!c) return d.close(connectionId);
@@ -291,7 +383,7 @@ export async function handleMessage(d: Deps, connectionId: string, raw: string |
     await d.send(connectionId, { type: 'reauth' });
     return d.close(connectionId);
   }
-  let msg: { type?: unknown; t?: unknown } | null = null;
+  let msg: { type?: unknown; t?: unknown; text?: unknown } | null = null;
   if (raw && Buffer.byteLength(raw) <= MAX_MESSAGE_BYTES) {
     try {
       msg = JSON.parse(raw);
@@ -303,5 +395,7 @@ export async function handleMessage(d: Deps, connectionId: string, raw: string |
     const t = typeof msg.t === 'number' && Number.isFinite(msg.t) ? msg.t : null;
     return d.send(connectionId, { type: 'pong', t, serverTime: d.now(), username: c.username, role: c.role });
   }
+  if (msg?.type === 'hello') return hello(d, connectionId, c);
+  if (msg?.type === 'say') return say(d, connectionId, c, msg.text);
   return d.send(connectionId, { type: 'error', code: 'unsupported_message' });
 }
