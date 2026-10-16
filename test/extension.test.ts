@@ -19,6 +19,7 @@ function devStack() {
     envName: 'dev',
     repoRoot,
     extensionId: 'persona-chat',
+    draftModel: 'us.anthropic.claude-haiku-5-5',
     wiki: { distributionArn: ARN, origin: 'https://wiki-dev.example.com', issuer: 'https://cognito-idp.us-west-2.amazonaws.com/us-west-2_EXAMPLE12', clientId: 'exampleclientid0123456789ab' },
     synthesizer: new DefaultStackSynthesizer({ qualifier: DEV_QUALIFIER }),
     permissionsBoundary: PermissionsBoundary.fromName(DEV_BOUNDARY_NAME),
@@ -77,14 +78,19 @@ test('the ticket API answers the wiki page only, the socket needs a ticket, and 
     if (fmt) assert.ok(!/header|querystring|authorizer/i.test(fmt), fmt);
   }
   // DynamoDB actions per function: tickets are written by one function and consumed by another.
+  const statements = of('AWS::IAM::Policy').flatMap(([, p]) => p.Properties.PolicyDocument.Statement as any[]);
   const actions = of('AWS::IAM::Policy')
     .map(([, p]) => (p.Properties.PolicyDocument.Statement as any[]).flatMap((s) => [s.Action].flat()).filter((a: string) => a.startsWith('dynamodb:')).sort())
     .filter((a) => a.length)
     .map((a) => a.join(','))
     .sort();
-  assert.deepEqual(actions, ['dynamodb:DeleteItem', 'dynamodb:DeleteItem,dynamodb:GetItem,dynamodb:PutItem', 'dynamodb:DeleteItem,dynamodb:GetItem,dynamodb:PutItem,dynamodb:PutItem,dynamodb:Scan']);
+  assert.deepEqual(actions, ['dynamodb:DeleteItem', 'dynamodb:DeleteItem,dynamodb:GetItem,dynamodb:PutItem', 'dynamodb:DeleteItem,dynamodb:GetItem,dynamodb:PutItem,dynamodb:PutItem,dynamodb:Scan,dynamodb:UpdateItem']);
+  // Bedrock: one model, through its US inference profile; nothing else can invoke models.
+  const invoke = statements.filter((s) => JSON.stringify(s.Action).includes('bedrock:'));
+  assert.equal(invoke.length, 1);
+  assert.deepEqual(invoke[0].Action, 'bedrock:InvokeModel');
+  assert.ok(invoke[0].Resource.every((r: string) => r.endsWith('/us.anthropic.claude-haiku-5-5') || r.endsWith('foundation-model/anthropic.claude-haiku-5-5')), JSON.stringify(invoke[0].Resource));
   // The catalog is touched by the HTTP function only, and nothing may scan the ticket / connection table.
-  const statements = of('AWS::IAM::Policy').flatMap(([, p]) => p.Properties.PolicyDocument.Statement as any[]);
   const catalogLogical = of('AWS::DynamoDB::GlobalTable').find(([k]) => k.startsWith('Catalog'))![0];
   for (const st of statements.filter((s) => [s.Action].flat().includes('dynamodb:Scan'))) assert.ok(JSON.stringify(st.Resource).includes(catalogLogical), JSON.stringify(st.Resource));
 });

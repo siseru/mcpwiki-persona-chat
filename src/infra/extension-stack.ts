@@ -31,7 +31,12 @@ export interface ExtensionStackProps extends StackProps {
   /** Extension id: the bundle lives under ext/<id>/ and is served by the wiki under /ext/<id>/. */
   extensionId: string;
   wiki: WikiLink;
+  /** Bedrock model for NPC drafts, as a US cross-region inference profile id (docs/spike.md). */
+  draftModel: string;
 }
+
+/** Regions a "us." inference profile routes to (docs/spike.md, 2026-10). */
+const US_PROFILE_REGIONS = ['us-east-1', 'us-east-2', 'us-west-2'];
 
 /**
  * The persona-chat extension for one environment.
@@ -91,8 +96,8 @@ export class ExtensionStack extends Stack {
 
     // ---------------------------------------------------------------- functions
     const code = lambda.Code.fromAsset(join(props.repoRoot, 'dist/backend'));
-    const environment = { WIKI_ORIGIN: wiki.origin, ISSUER: wiki.issuer, CLIENT_ID: wiki.clientId, TABLE: table.tableName, CATALOG: catalog.tableName };
-    const fn = (name: string, handler: string, description: string) => {
+    const environment = { WIKI_ORIGIN: wiki.origin, ISSUER: wiki.issuer, CLIENT_ID: wiki.clientId, TABLE: table.tableName, CATALOG: catalog.tableName, MODEL_ID: props.draftModel };
+    const fn = (name: string, handler: string, description: string, timeout = Duration.seconds(10)) => {
       const logGroup = new logs.LogGroup(this, `${name}Logs`, { retention: logs.RetentionDays.ONE_MONTH, removalPolicy: RemovalPolicy.DESTROY });
       return new lambda.Function(this, name, {
         runtime: lambda.Runtime.NODEJS_24_X,
@@ -100,7 +105,7 @@ export class ExtensionStack extends Stack {
         handler: `index.${handler}`,
         code,
         memorySize: 256,
-        timeout: Duration.seconds(10),
+        timeout,
         // Caps a flood's share of the account-wide concurrency pool.
         reservedConcurrentExecutions: prod ? 20 : 5,
         logGroup,
@@ -108,12 +113,25 @@ export class ExtensionStack extends Stack {
         description: `persona-chat ${props.envName}: ${description}`,
       });
     };
-    const httpFn = fn('HttpFn', 'http', 'HTTP API (tickets, facilities)');
+    // Drafts wait for the model: just under the HTTP API's 30 s integration limit.
+    const httpFn = fn('HttpFn', 'http', 'HTTP API (tickets, facilities, drafts)', Duration.seconds(29));
     const authorizerFn = fn('AuthorizerFn', 'authorize', 'WebSocket $connect authorizer');
     const wsFn = fn('WsFn', 'ws', 'WebSocket routes');
     // Least privilege: tickets are written by one function and consumed by another; connections by the routes; only
     // the HTTP function touches the catalog.
-    httpFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:PutItem'], resources: [table.tableArn] }));
+    httpFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:PutItem', 'dynamodb:UpdateItem'], resources: [table.tableArn] })); // tickets, draft budgets
+    // Drafts: this one model only, through its US inference profile.
+    if (!/^us\.[a-z0-9.:-]+$/.test(props.draftModel)) throw new Error('draftModel must be a "us." inference profile id');
+    const foundationModel = props.draftModel.slice('us.'.length);
+    httpFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['bedrock:InvokeModel'],
+        resources: [
+          `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/${props.draftModel}`,
+          ...US_PROFILE_REGIONS.map((r) => `arn:aws:bedrock:${r}::foundation-model/${foundationModel}`),
+        ],
+      }),
+    );
     httpFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:DeleteItem', 'dynamodb:Scan'], resources: [catalog.tableArn] }));
     authorizerFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:DeleteItem'], resources: [table.tableArn] }));
     wsFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:DeleteItem'], resources: [table.tableArn] }));
@@ -129,7 +147,11 @@ export class ExtensionStack extends Stack {
       },
     });
     const httpIntegration = new integrations.HttpLambdaIntegration('TicketIntegration', httpFn);
-    for (const [method, path] of [[apigw.HttpMethod.POST, '/ticket'], [apigw.HttpMethod.POST, '/publish'], [apigw.HttpMethod.POST, '/unpublish'], [apigw.HttpMethod.GET, '/facilities']] as const) {
+    const routes = [
+      [apigw.HttpMethod.POST, '/ticket'], [apigw.HttpMethod.POST, '/publish'], [apigw.HttpMethod.POST, '/unpublish'], [apigw.HttpMethod.GET, '/facilities'],
+      [apigw.HttpMethod.POST, '/draft'], [apigw.HttpMethod.POST, '/adopt'],
+    ] as const;
+    for (const [method, path] of routes) {
       http.addRoutes({ path, methods: [method], integration: httpIntegration });
     }
     const httpStage = http.defaultStage!.node.defaultChild as apigw.CfnStage;

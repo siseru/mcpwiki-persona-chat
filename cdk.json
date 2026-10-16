@@ -11,6 +11,8 @@
     "@aws-cdk/core:checkSecretUsage": true,
     "@aws-cdk/core:enablePartitionLiterals": true,
     "cli-telemetry": false,
-    "devBedrockModels": []
+    "devBedrockModels": [
+      "anthropic.claude-haiku-5-5"
+    ]
   }
 }
