@@ -84,12 +84,15 @@ test('the ticket API answers the wiki page only, the socket needs a ticket, and 
     .filter((a) => a.length)
     .map((a) => a.join(','))
     .sort();
-  assert.deepEqual(actions, ['dynamodb:DeleteItem', 'dynamodb:DeleteItem,dynamodb:GetItem,dynamodb:PutItem', 'dynamodb:DeleteItem,dynamodb:GetItem,dynamodb:PutItem,dynamodb:PutItem,dynamodb:Scan,dynamodb:UpdateItem']);
+  assert.deepEqual(actions, [
+    'dynamodb:DeleteItem', // authorizer: consumes tickets
+    'dynamodb:DeleteItem,dynamodb:GetItem,dynamodb:GetItem,dynamodb:PutItem,dynamodb:UpdateItem', // routes: connections, conversations, budgets; reads snapshots
+    'dynamodb:DeleteItem,dynamodb:GetItem,dynamodb:PutItem,dynamodb:PutItem,dynamodb:Scan,dynamodb:UpdateItem', // HTTP: tickets, budgets, catalog
+  ]);
   // Bedrock: one model, through its US inference profile; nothing else can invoke models.
   const invoke = statements.filter((s) => JSON.stringify(s.Action).includes('bedrock:'));
-  assert.equal(invoke.length, 1);
-  assert.deepEqual(invoke[0].Action, 'bedrock:InvokeModel');
-  assert.ok(invoke[0].Resource.every((r: string) => r.endsWith('/us.anthropic.claude-haiku-5-5') || r.endsWith('foundation-model/anthropic.claude-haiku-5-5')), JSON.stringify(invoke[0].Resource));
+  assert.deepEqual(invoke.map((s) => s.Action).sort(), ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream']);
+  for (const s of invoke) assert.ok(s.Resource.every((r: string) => r.endsWith('/us.anthropic.claude-haiku-5-5') || r.endsWith('foundation-model/anthropic.claude-haiku-5-5')), JSON.stringify(s.Resource));
   // The catalog is touched by the HTTP function only, and nothing may scan the ticket / connection table.
   const catalogLogical = of('AWS::DynamoDB::GlobalTable').find(([k]) => k.startsWith('Catalog'))![0];
   for (const st of statements.filter((s) => [s.Action].flat().includes('dynamodb:Scan'))) assert.ok(JSON.stringify(st.Resource).includes(catalogLogical), JSON.stringify(st.Resource));

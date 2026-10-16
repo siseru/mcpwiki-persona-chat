@@ -82,6 +82,168 @@ const FACILITY_TYPES = ['Facility', 'Organization'];
 const describe = (f: PublicFacility) =>
   `定員 ${f.capacity} 人${f.hours ? `・営業 ${f.hours}` : ''}・NPC: ${f.npcs.map((n) => `${n.name}（${n.role}）`).join('、')}`;
 
+// ------------------------------------------------------------------ conversations (Task 8)
+
+interface Summary {
+  id: string;
+  type: string;
+  title: string;
+}
+
+/** The user's own PC articles, through the wiki's API (same origin, the user's own token). */
+async function myPCs(ctx: HostContext): Promise<Summary[]> {
+  const token = await ctx.getAccessToken();
+  const r = await fetch('/api/articles?mine=1&limit=200', { headers: { authorization: `Bearer ${token}`, accept: 'application/json' }, signal: ctx.signal });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return ((await r.json()) as { items: Summary[] }).items.filter((a) => a.type === 'PC');
+}
+
+/** Creates a PC article owned by the user (the wiki's editor has no field for the article type). */
+async function createPC(ctx: HostContext, name: string, intro: string): Promise<{ id?: string; error?: string }> {
+  const token = await ctx.getAccessToken();
+  const r = await fetch('/api/articles', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({ type: 'PC', title: name, body: intro, tags: ['persona-chat'], readScope: 'all', writeScope: 'owner' }),
+    signal: ctx.signal,
+  });
+  const body = (await r.json().catch(() => ({}))) as { id?: string; error?: { message?: string } };
+  if (r.status === 403) return { error: 'PC を作るには、Wiki の投稿者（editor）以上の権限が必要です。' };
+  return r.ok ? { id: body.id } : { error: body.error?.message ?? `HTTP ${r.status}` };
+}
+
+const CHAT_ERRORS: Record<string, string> = {
+  too_fast: '少し待ってから話しかけてください（3 秒に 1 回まで）。',
+  budget_exceeded: '今日は話せる回数の上限に達しました。',
+  model_unavailable: '返事を作れませんでした。もう一度話しかけてください。',
+  bad_text: '1〜500 文字で話しかけてください。',
+  not_published: 'この場は、今は公開されていません。',
+  no_session: '入り直してください。',
+};
+
+function select(label: string, options: { value: string; text: string }[]) {
+  const box = css(document.createElement('label'), { display: 'block', margin: '0 0 0.6rem' });
+  const sel = document.createElement('select');
+  for (const o of options) {
+    const opt = document.createElement('option');
+    opt.value = o.value;
+    opt.textContent = o.text;
+    sel.append(opt);
+  }
+  css(sel, { marginLeft: '0.5rem' });
+  box.append(text('span', label), sel);
+  return { box, get: () => sel.value };
+}
+
+/** Choose (or create) a PC and an NPC, then talk. */
+async function enterPanel(ctx: HostContext, el: HTMLElement, f: PublicFacility) {
+  el.replaceChildren();
+  let pcs: Summary[];
+  try {
+    pcs = await myPCs(ctx);
+  } catch (e) {
+    return void el.append(text('p', `PC の一覧を取得できませんでした: ${e instanceof Error ? e.message : String(e)}`, 'error'));
+  }
+  if (!pcs.length) {
+    const name = input('PC の名前', '');
+    const intro = input('PC の紹介（記事の本文になります。ほかの利用者も読めます）', '', { multiline: true, rows: 3 });
+    const make = text('button', 'PC の記事を作る') as HTMLButtonElement;
+    const msg = text('p', '', 'muted');
+    make.addEventListener('click', async () => {
+      if (!name.get()) return void (msg.textContent = '名前を入れてください。');
+      make.disabled = true;
+      const r = await createPC(ctx, name.get(), intro.get());
+      make.disabled = false;
+      if (r.error) return void (msg.textContent = `作れませんでした: ${r.error}`);
+      void enterPanel(ctx, el, f);
+    });
+    return void el.append(text('p', 'この場に入るには、あなたの PC（プレイヤーキャラクター）の記事が必要です。'), name.box, intro.box, make, msg);
+  }
+  const pc = select('PC:', pcs.map((p) => ({ value: p.id, text: p.title })));
+  const npc = select('話す相手:', f.npcs.map((n) => ({ value: n.id, text: `${n.name}（${n.role}）` })));
+  const go = text('button', '入る') as HTMLButtonElement;
+  const msg = text('p', '', 'muted');
+  go.addEventListener('click', async () => {
+    go.disabled = true;
+    msg.textContent = '入っています…';
+    try {
+      const { ticketUrl, socketUrl } = await endpoints();
+      const token = await ctx.getAccessToken();
+      const r = await fetch(ticketUrl, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ facilityId: f.id, npcId: npc.get(), pcId: pc.get() }), signal: ctx.signal });
+      const body = (await r.json().catch(() => ({}))) as { ticket?: string; message?: string; error?: string };
+      if (!r.ok || !body.ticket) return void (msg.textContent = `入れませんでした: ${body.message ?? body.error ?? `HTTP ${r.status}`}`);
+      chat(ctx, el, new WebSocket(`${socketUrl}?ticket=${encodeURIComponent(body.ticket)}`), pcs.find((p) => p.id === pc.get())!.title);
+    } finally {
+      go.disabled = false;
+    }
+  });
+  el.append(pc.box, npc.box, go, msg);
+}
+
+function chat(ctx: HostContext, el: HTMLElement, socket: WebSocket, pcName: string) {
+  el.replaceChildren();
+  ctx.signal.addEventListener('abort', () => socket.close());
+  const log = css(document.createElement('div'), { border: '1px solid currentColor', borderRadius: '6px', padding: '0.6rem', minHeight: '8rem', maxHeight: '24rem', overflowY: 'auto', margin: '0 0 0.6rem' });
+  const status = text('p', '接続しています…', 'muted');
+  const say = input(`${pcName} として話す（Enter で送信、Shift+Enter で改行）`, '', { multiline: true, rows: 2 });
+  const area = say.box.querySelector('textarea')!;
+  const send = text('button', '話す') as HTMLButtonElement;
+  const leave = text('button', '出る') as HTMLButtonElement;
+  leave.className = 'secondary';
+  let npcName = 'NPC';
+  let current: HTMLElement | null = null;
+  const line = (who: string, words: string) => {
+    const p = css(document.createElement('p'), { margin: '0 0 0.5rem' });
+    p.append(text('strong', `${who}: `), text('span', words));
+    log.append(p);
+    log.scrollTop = log.scrollHeight;
+    return p.lastElementChild as HTMLElement;
+  };
+  const submit = () => {
+    const words = say.get();
+    if (!words || socket.readyState !== WebSocket.OPEN) return;
+    line(pcName, words);
+    socket.send(JSON.stringify({ type: 'say', text: words }));
+    area.value = '';
+  };
+  send.addEventListener('click', submit);
+  area.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
+      ev.preventDefault();
+      submit();
+    }
+  });
+  leave.addEventListener('click', () => socket.close());
+  socket.addEventListener('open', () => socket.send(JSON.stringify({ type: 'hello' })));
+  socket.addEventListener('message', (ev) => {
+    const m = JSON.parse(String(ev.data)) as { type: string; text?: string; code?: string; npc?: { name: string }; facility?: string };
+    if (m.type === 'npc') {
+      npcName = m.npc!.name;
+      status.textContent = `${m.facility} で ${npcName} と話しています。`;
+      line(npcName, m.text ?? '');
+    } else if (m.type === 'start') {
+      current = line(npcName, '…');
+      current.textContent = '';
+    } else if (m.type === 'delta' && current) {
+      current.textContent += m.text ?? '';
+      log.scrollTop = log.scrollHeight;
+    } else if (m.type === 'done' && current) {
+      current.textContent = m.text ?? current.textContent;
+      current = null;
+    } else if (m.type === 'reauth') {
+      status.textContent = '長い時間がたったので、いったん切断します。もう一度「入る」を押してください。';
+    } else if (m.type === 'error') {
+      if (current) (current.textContent ||= '……'), (current = null);
+      status.textContent = CHAT_ERRORS[m.code ?? ''] ?? `エラー: ${m.code}`;
+    }
+  });
+  socket.addEventListener('close', () => {
+    send.disabled = true;
+    status.textContent = `${status.textContent ?? ''}（退出しました）`;
+  });
+  el.append(status, log, say.box, send, ' ', leave);
+}
+
 /** Below a facility article: whether it is published; for DMs (admins), publish / update / unpublish. */
 async function facilitySlot(ctx: HostContext, el: HTMLElement) {
   const article = ctx.article!;
@@ -96,6 +258,17 @@ async function facilitySlot(ctx: HostContext, el: HTMLElement) {
     return !!f;
   };
   const published = await refresh();
+  if (published) {
+    const room = document.createElement('div');
+    const enter = text('button', 'この場に入る') as HTMLButtonElement;
+    enter.addEventListener('click', async () => {
+      const r = await api<{ items: PublicFacility[] }>(ctx, 'GET', '/facilities');
+      const f = r.body.items?.find((x) => x.id === article.id);
+      if (f) void enterPanel(ctx, room, f);
+    });
+    room.append(enter);
+    box.append(room);
+  }
   if (ctx.me.role !== 'admin') {
     if (!published) box.remove(); // nothing to say to players about unpublished places
     return;

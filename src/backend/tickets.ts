@@ -14,6 +14,16 @@ export interface Identity {
   sub: string;
   username: string;
   role: 'admin' | 'editor' | 'viewer';
+  /** Set when the ticket was asked for to enter a facility: checked once, when the ticket was issued. */
+  session?: Session;
+}
+
+/** A PC talking with one NPC of a published facility. */
+export interface Session {
+  facilityId: string;
+  npcId: string;
+  pcId: string;
+  pcName: string;
 }
 
 export interface TicketStore {
