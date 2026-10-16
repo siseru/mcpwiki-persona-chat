@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { test } from 'node:test';
-import { handleAuthorize, handleMessage, handleTicket, type Connection, type ConnectionStore, type Deps } from '../src/backend/handlers.js';
+import type { Publication } from '../src/backend/catalog.js';
+import { handleAuthorize, handleList, handleMessage, handlePublish, handleTicket, handleUnpublish, type CatalogStore, type Connection, type ConnectionStore, type Deps } from '../src/backend/handlers.js';
 import { AuthError, TokenVerifier } from '../src/backend/jwt.js';
 import { MAX_CONNECTION_SEC, MemoryTicketStore, TICKET_TTL_SEC, ticketHash } from '../src/backend/tickets.js';
 
@@ -19,7 +20,8 @@ function token(claims: Record<string, unknown> = {}, header: Record<string, unkn
   return `${h}.${p}.${sign('RSA-SHA256', Buffer.from(`${h}.${p}`), privateKey).toString('base64url')}`;
 }
 
-function setup(me: { status: number; body: unknown } = { status: 200, body: { username: 'alice', role: 'editor' } }) {
+type Articles = Record<string, Record<string, unknown>>;
+function setup(me: { status: number; body: unknown } = { status: 200, body: { username: 'alice', role: 'editor' } }, articles: Articles = {}) {
   const tickets = new MemoryTicketStore();
   const conns = new Map<string, Connection>();
   const connections: ConnectionStore = {
@@ -31,18 +33,28 @@ function setup(me: { status: number; body: unknown } = { status: 200, body: { us
   const closed: string[] = [];
   const logs: Record<string, unknown>[] = [];
   const meCalls: string[] = [];
+  const pubs = new Map<string, { publication: Publication; versions: string }>();
+  const catalog: CatalogStore = {
+    get: async (id) => pubs.get(id) ?? null,
+    put: async (id, publication, versions) => void pubs.set(id, { publication, versions }),
+    delete: async (id) => void pubs.delete(id),
+    list: async () => [...pubs.values()].map((p) => p.publication),
+  };
+  const articleCalls: string[] = [];
   const d: Deps = {
     wikiOrigin: ORIGIN,
     verifier: new TokenVerifier({ issuer: ISSUER, clientId: CLIENT, fetchJwks: async () => ({ keys: [jwk] }), now: () => clock }),
     tickets,
     connections,
+    catalog,
     fetchMe: async (t) => (meCalls.push(t), me),
+    fetchArticle: async (_t, id) => (articleCalls.push(id), articles[id] ? { status: 200, body: articles[id] } : { status: 404, body: { error: {} } }),
     send: async (id, data) => void sent.push({ id, data }),
     close: async (id) => void closed.push(id),
     now: () => clock,
     log: (e) => void logs.push(e),
   };
-  return { d, tickets, conns, sent, closed, logs, meCalls };
+  return { d, tickets, conns, sent, closed, logs, meCalls, pubs, articleCalls };
 }
 
 test('access tokens are verified with the wiki rules', async () => {
@@ -123,4 +135,94 @@ test('ping gets a pong; stale or unknown connections are told to reconnect or cl
   await handleMessage(s.d, 'c1', JSON.stringify({ type: 'ping' }));
   assert.deepEqual(s.sent.pop(), { id: 'c1', data: { type: 'reauth' } });
   assert.deepEqual(s.closed, ['nobody', 'c1']);
+});
+
+// ------------------------------------------------------------------ facilities and NPCs
+
+const ADMIN = { status: 200, body: { username: 'dm', role: 'admin' } };
+const inn = (extra: Record<string, unknown> = {}, more: Record<string, unknown> = {}) => ({
+  id: 'harbor-inn', type: 'Facility', title: '港の宿', version: 3, readScope: 'all',
+  extra: { persona_chat: { capacity: 4, hours: '18:00-02:00', npcs: ['minato'], ...extra } }, body: '港の宿。', ...more,
+});
+const minato = (extra: Record<string, unknown> = {}, more: Record<string, unknown> = {}) => ({
+  id: 'minato', type: 'NPC', title: '店主ミナト', version: 7, readScope: 'admin', body: '元船乗り。',
+  extra: {
+    persona_chat: {
+      name: 'ミナト', role: '港の宿の店主', persona: '面倒見がよく、噂話が好き。', voice: '丁寧だが砕けた口調',
+      knowledge: ['港の船の出入り'], secrets: [{ text: '地下に密輸品を隠している', reveal: { afterVisits: 3 } }], greeting: 'いらっしゃい！', ...extra,
+    },
+  },
+  ...more,
+});
+const post = (body: unknown) => ({ authorization: `Bearer ${token()}`, origin: ORIGIN, body: JSON.stringify(body) });
+
+test('a DM publishes a facility; the snapshot keeps the NPC, the public view hides persona and secrets', async () => {
+  const s = setup(ADMIN, { 'harbor-inn': inn(), minato: minato() });
+  const r = await handlePublish(s.d, post({ facilityId: 'harbor-inn' }));
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.result, 'published');
+  const stored = s.pubs.get('harbor-inn')!;
+  assert.equal(stored.versions, 'harbor-inn@3,minato@7');
+  assert.equal(stored.publication.npcs[0]!.secrets[0]!.text, '地下に密輸品を隠している');
+  assert.equal(stored.publication.npcs[0]!.background, '元船乗り。');
+  assert.equal(stored.publication.publishedBy, 'dm');
+  // Same article versions again: nothing changes. New versions: updated.
+  assert.equal((await handlePublish(s.d, post({ facilityId: 'harbor-inn' }))).body.result, 'unchanged');
+  (s.d as any).fetchArticle = async (_t: string, id: string) => ({ status: 200, body: id === 'minato' ? minato({ greeting: 'よう！' }, { version: 8 }) : inn() });
+  assert.equal((await handlePublish(s.d, post({ facilityId: 'harbor-inn' }))).body.result, 'updated');
+  // Everybody may list; nobody sees the persona, knowledge, secrets or background there.
+  const viewer = setup({ status: 200, body: { username: 'bob', role: 'viewer' } });
+  (viewer.d as any).catalog = s.d.catalog;
+  const list = await handleList(viewer.d, { authorization: `Bearer ${token()}`, origin: ORIGIN });
+  assert.equal(list.status, 200);
+  assert.deepEqual((list.body.items as any[])[0].npcs, [{ id: 'minato', name: 'ミナト', role: '港の宿の店主' }]);
+  for (const hidden of ['密輸', '面倒見', '元船乗り', '船の出入り', '砕けた']) assert.ok(!JSON.stringify(list.body).includes(hidden), hidden);
+  // Unpublish: gone from the list.
+  assert.equal((await handleUnpublish(s.d, post({ facilityId: 'harbor-inn' }))).body.result, 'unpublished');
+  assert.deepEqual((await handleList(viewer.d, { authorization: `Bearer ${token()}`, origin: ORIGIN })).body.items, []);
+});
+
+test('only admins publish, and only valid articles with admin-only NPCs get published', async () => {
+  for (const role of ['editor', 'viewer']) {
+    const s = setup({ status: 200, body: { username: 'x', role } }, { 'harbor-inn': inn(), minato: minato() });
+    assert.equal((await handlePublish(s.d, post({ facilityId: 'harbor-inn' }))).status, 403, role);
+    assert.equal((await handleUnpublish(s.d, post({ facilityId: 'harbor-inn' }))).status, 403, role);
+    assert.deepEqual(s.articleCalls, [], 'nothing is read for non-admins');
+  }
+  const bad: [string, Articles, RegExp | string][] = [
+    ['NPC readable by everyone', { 'harbor-inn': inn(), minato: minato({}, { readScope: 'all' }) }, /readScope: admin/],
+    ['NPC readable by its owner', { 'harbor-inn': inn(), minato: minato({}, { readScope: 'owner' }) }, /readScope: admin/],
+    ['wrong facility type', { 'harbor-inn': inn({}, { type: 'Place' }) }, /type must be/],
+    ['NPC article is not an NPC', { 'harbor-inn': inn(), minato: minato({}, { type: 'PC' }) }, /type must be NPC/],
+    ['no persona_chat', { 'harbor-inn': inn({}, { extra: {} }) }, /persona_chat is missing/],
+    ['capacity 0', { 'harbor-inn': inn({ capacity: 0 }) }, /capacity/],
+    ['capacity 1.5', { 'harbor-inn': inn({ capacity: 1.5 }) }, /capacity/],
+    ['no NPCs', { 'harbor-inn': inn({ npcs: [] }) }, /at least one/],
+    ['six NPCs', { 'harbor-inn': inn({ npcs: ['a', 'b', 'c', 'd', 'e', 'f'] }) }, /more than 5/],
+    ['NPC id is a path', { 'harbor-inn': inn({ npcs: ['../admin'] }) }, /article id/],
+    ['duplicate NPC', { 'harbor-inn': inn({ npcs: ['minato', 'minato'] }), minato: minato() }, /duplicate/],
+    ['missing NPC article', { 'harbor-inn': inn() }, 'article_not_found'],
+    ['deleted NPC article', { 'harbor-inn': inn(), minato: minato({}, { deleted: true }) }, 'article_not_found'],
+    ['missing persona', { 'harbor-inn': inn(), minato: minato({ persona: '' }) }, /persona is required/],
+    ['persona too long', { 'harbor-inn': inn(), minato: minato({ persona: 'x'.repeat(2001) }) }, /longer than 2000/],
+    ['secret without condition', { 'harbor-inn': inn(), minato: minato({ secrets: [{ text: 's' }] }) }, /afterVisits or keywords/],
+    ['bidi in name', { 'harbor-inn': inn(), minato: minato({ name: 'a\u202eb' }) }, /control characters/],
+    ['knowledge not a list', { 'harbor-inn': inn(), minato: minato({ knowledge: 'x' }) }, /must be a list/],
+  ];
+  for (const [what, articles, expected] of bad) {
+    const s = setup(ADMIN, articles);
+    const r = await handlePublish(s.d, post({ facilityId: 'harbor-inn' }));
+    assert.equal(r.status, 400, what);
+    if (typeof expected === 'string') assert.equal(r.body.error, expected, what);
+    else assert.match(String(r.body.message), expected, what);
+    assert.equal(s.pubs.size, 0, what);
+  }
+  for (const body of [{}, { facilityId: '../x' }, { facilityId: 3 }, 'not json']) {
+    const s = setup(ADMIN, {});
+    assert.equal((await handlePublish(s.d, { authorization: `Bearer ${token()}`, origin: ORIGIN, body: typeof body === 'string' ? body : JSON.stringify(body) })).status, 400);
+  }
+  // The usual gate applies to every route.
+  const s = setup(ADMIN, { 'harbor-inn': inn(), minato: minato() });
+  assert.equal((await handlePublish(s.d, { ...post({ facilityId: 'harbor-inn' }), origin: 'https://evil.example' })).status, 403);
+  assert.equal((await handleList(s.d, { origin: ORIGIN })).status, 401);
 });

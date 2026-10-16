@@ -1,8 +1,9 @@
 // Lambda entry points (bundled by scripts/build.mjs into dist/backend/index.mjs; the AWS SDK comes from the
-// Lambda runtime). Configuration: WIKI_ORIGIN, ISSUER, CLIENT_ID, TABLE.
+// Lambda runtime). Configuration: WIKI_ORIGIN, ISSUER, CLIENT_ID, TABLE (tickets, connections), CATALOG (publications).
 import { ApiGatewayManagementApiClient, DeleteConnectionCommand, GoneException, PostToConnectionCommand } from '@aws-sdk/client-apigatewaymanagementapi';
-import { ConditionalCheckFailedException, DeleteItemCommand, DynamoDBClient, GetItemCommand, PutItemCommand } from '@aws-sdk/client-dynamodb';
-import { handleAuthorize, handleConnect, handleDisconnect, handleMessage, handleTicket, type Connection, type ConnectionStore, type Deps } from './handlers.js';
+import { ConditionalCheckFailedException, DeleteItemCommand, DynamoDBClient, GetItemCommand, PutItemCommand, ScanCommand } from '@aws-sdk/client-dynamodb';
+import type { Publication } from './catalog.js';
+import { handleAuthorize, handleConnect, handleDisconnect, handleList, handleMessage, handlePublish, handleTicket, handleUnpublish, type CatalogStore, type Connection, type ConnectionStore, type Deps, type HttpRequest, type HttpResult } from './handlers.js';
 import { TokenVerifier } from './jwt.js';
 import type { Identity, TicketStore } from './tickets.js';
 
@@ -14,6 +15,7 @@ const env = (k: string) => {
 const WIKI_ORIGIN = env('WIKI_ORIGIN');
 const ISSUER = env('ISSUER');
 const TABLE = env('TABLE');
+const CATALOG = env('CATALOG');
 const db = new DynamoDBClient({});
 
 const tickets: TicketStore = {
@@ -53,6 +55,30 @@ const connections: ConnectionStore = {
   },
 };
 
+const catalog: CatalogStore = {
+  async get(id) {
+    const r = await db.send(new GetItemCommand({ TableName: CATALOG, Key: { id: { S: id } }, ConsistentRead: true }));
+    return r.Item?.publication?.S ? { publication: JSON.parse(r.Item.publication.S) as Publication, versions: r.Item.versions?.S ?? '' } : null;
+  },
+  async put(id, publication, versions) {
+    await db.send(new PutItemCommand({ TableName: CATALOG, Item: { id: { S: id }, publication: { S: JSON.stringify(publication) }, versions: { S: versions } } }));
+  },
+  async delete(id) {
+    await db.send(new DeleteItemCommand({ TableName: CATALOG, Key: { id: { S: id } } }));
+  },
+  async list() {
+    // A handful of facilities per wiki: a scan is fine (paginated for completeness).
+    const out: Publication[] = [];
+    let start: Record<string, never> | undefined;
+    do {
+      const r = await db.send(new ScanCommand({ TableName: CATALOG, ProjectionExpression: 'publication', ExclusiveStartKey: start }));
+      for (const it of r.Items ?? []) if (it.publication?.S) out.push(JSON.parse(it.publication.S) as Publication);
+      start = r.LastEvaluatedKey as typeof start;
+    } while (start);
+    return out;
+  },
+};
+
 const verifier = new TokenVerifier({
   issuer: ISSUER,
   clientId: env('CLIENT_ID'),
@@ -62,6 +88,12 @@ const verifier = new TokenVerifier({
     return (await r.json()) as { keys: [] };
   },
 });
+
+/** GET on the wiki's API with the user's own token (the wiki applies its own permissions). */
+async function wikiGet(token: string, path: string): Promise<{ status: number; body: unknown }> {
+  const r = await fetch(`${WIKI_ORIGIN}${path}`, { headers: { authorization: `Bearer ${token}`, accept: 'application/json' }, signal: AbortSignal.timeout(5000) });
+  return { status: r.status, body: r.headers.get('content-type')?.includes('json') ? await r.json() : null };
+}
 
 const managers = new Map<string, ApiGatewayManagementApiClient>();
 const manager = (ctx: { domainName: string; stage: string }) => {
@@ -76,10 +108,9 @@ const deps = (ws?: { domainName: string; stage: string }): Deps => ({
   verifier,
   tickets,
   connections,
-  fetchMe: async (token) => {
-    const r = await fetch(`${WIKI_ORIGIN}/api/me`, { headers: { authorization: `Bearer ${token}`, accept: 'application/json' }, signal: AbortSignal.timeout(5000) });
-    return { status: r.status, body: r.headers.get('content-type')?.includes('json') ? await r.json() : null };
-  },
+  catalog,
+  fetchMe: (token) => wikiGet(token, '/api/me'),
+  fetchArticle: (token, id) => wikiGet(token, `/api/articles/${encodeURIComponent(id)}`),
   send: async (connectionId, data) => {
     try {
       await manager(ws!).send(new PostToConnectionCommand({ ConnectionId: connectionId, Data: Buffer.from(JSON.stringify(data)) }));
@@ -101,10 +132,19 @@ const deps = (ws?: { domainName: string; stage: string }): Deps => ({
 
 const lower = (h: Record<string, string | undefined> | undefined) => Object.fromEntries(Object.entries(h ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
 
-/** HTTP API (payload 2.0): POST /ticket. */
-export async function ticket(event: { headers?: Record<string, string | undefined> }) {
+const ROUTES: Record<string, (d: Deps, req: HttpRequest) => Promise<HttpResult>> = {
+  'POST /ticket': handleTicket,
+  'POST /publish': handlePublish,
+  'POST /unpublish': handleUnpublish,
+  'GET /facilities': handleList,
+};
+
+/** HTTP API (payload 2.0): the routes above. */
+export async function http(event: { routeKey?: string; headers?: Record<string, string | undefined>; body?: string; isBase64Encoded?: boolean }) {
   const h = lower(event.headers);
-  const r = await handleTicket(deps(), { authorization: h.authorization, origin: h.origin });
+  const route = ROUTES[event.routeKey ?? ''];
+  const body = event.body && event.isBase64Encoded ? Buffer.from(event.body, 'base64').toString('utf8') : event.body;
+  const r = route ? await route(deps(), { authorization: h.authorization, origin: h.origin, body: body && body.length <= 4096 ? body : undefined }) : { status: 404, body: { error: 'not_found' } };
   return { statusCode: r.status, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' }, body: JSON.stringify(r.body) };
 }
 

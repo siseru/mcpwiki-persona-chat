@@ -1,5 +1,6 @@
 // Request handling, independent of AWS (the Lambda entry points in index.ts wire in DynamoDB, the API Gateway
 // management API and fetch). Never logs tokens, tickets or message text.
+import { ARTICLE_ID_RE, parseFacility, parseNpc, publicView, SchemaError, sourceVersions, type Publication, type WikiArticle } from './catalog.js';
 import { AuthError, type TokenVerifier } from './jwt.js';
 import { issueTicket, MAX_CONNECTION_SEC, redeemTicket, type Identity, type TicketStore } from './tickets.js';
 
@@ -13,14 +14,24 @@ export interface ConnectionStore {
   delete(id: string): Promise<void>;
 }
 
+export interface CatalogStore {
+  get(id: string): Promise<{ publication: Publication; versions: string } | null>;
+  put(id: string, publication: Publication, versions: string): Promise<void>;
+  delete(id: string): Promise<void>;
+  list(): Promise<Publication[]>;
+}
+
 export interface Deps {
   /** The wiki's origin (https://host): the only page allowed to ask for tickets and to connect. */
   wikiOrigin: string;
   verifier: TokenVerifier;
   tickets: TicketStore;
   connections: ConnectionStore;
+  catalog: CatalogStore;
   /** GET <wiki>/api/me with the user's token: the wiki decides whether the account is active and its role. */
   fetchMe: (token: string) => Promise<{ status: number; body: unknown }>;
+  /** GET <wiki>/api/articles/<id> with the user's token: the wiki decides what the user may read. */
+  fetchArticle: (token: string, id: string) => Promise<{ status: number; body: unknown }>;
   send: (connectionId: string, data: unknown) => Promise<void>;
   close: (connectionId: string) => Promise<void>;
   now: () => number; // epoch seconds
@@ -35,8 +46,18 @@ export interface HttpResult {
 const ROLES = new Set(['admin', 'editor', 'viewer']);
 const MAX_MESSAGE_BYTES = 4096;
 
-/** POST /ticket with "Authorization: Bearer <access token>" from the wiki's page. */
-export async function handleTicket(d: Deps, req: { authorization?: string; origin?: string }): Promise<HttpResult> {
+export interface HttpRequest {
+  authorization?: string;
+  origin?: string;
+  body?: string;
+}
+
+/**
+ * Every HTTP route: the wiki's page only, a valid access token, and an account the wiki accepts. The wiki is the
+ * authority on accounts (disabled users, revoked tokens, roles). Returns the identity and the token (used for this
+ * request's calls to the wiki only, never stored), or the error response.
+ */
+async function authenticate(d: Deps, req: HttpRequest): Promise<{ identity: Identity; token: string } | HttpResult> {
   if (req.origin !== d.wikiOrigin) return { status: 403, body: { error: 'origin_not_allowed' } };
   const m = /^Bearer\s+([A-Za-z0-9._~+/=-]+)$/.exec(req.authorization ?? '');
   if (!m) return { status: 401, body: { error: 'unauthorized' } };
@@ -48,7 +69,6 @@ export async function handleTicket(d: Deps, req: { authorization?: string; origi
     if (e instanceof AuthError) return { status: 401, body: { error: 'unauthorized' } };
     throw e;
   }
-  // The wiki is the authority on accounts: disabled users, revoked tokens and roles are decided there.
   const me = await d.fetchMe(token);
   const body = me.body as { username?: unknown; role?: unknown } | null;
   if (me.status === 401) return { status: 401, body: { error: 'unauthorized' } };
@@ -56,10 +76,91 @@ export async function handleTicket(d: Deps, req: { authorization?: string; origi
     d.log({ msg: 'wiki account check failed', status: me.status });
     return { status: me.status === 403 ? 403 : 502, body: { error: me.status === 403 ? 'forbidden' : 'wiki_unavailable' } };
   }
-  const identity: Identity = { sub, username: body.username, role: body.role as Identity['role'] };
+  return { identity: { sub, username: body.username, role: body.role as Identity['role'] }, token };
+}
+const failed = (r: Awaited<ReturnType<typeof authenticate>>): r is HttpResult => 'status' in r;
+
+/** POST /ticket with "Authorization: Bearer <access token>" from the wiki's page. */
+export async function handleTicket(d: Deps, req: HttpRequest): Promise<HttpResult> {
+  const auth = await authenticate(d, req);
+  if (failed(auth)) return auth;
+  const { identity } = auth;
   const { ticket, expiresAt } = await issueTicket(d.tickets, identity, d.now());
-  d.log({ msg: 'connection pass issued', sub });
+  d.log({ msg: 'connection pass issued', sub: identity.sub });
   return { status: 200, body: { ticket, expiresAt, maxConnectionSec: MAX_CONNECTION_SEC } };
+}
+
+function facilityIdFrom(body: string | undefined): string | null {
+  try {
+    const id = (JSON.parse(body ?? '') as { facilityId?: unknown }).facilityId;
+    return typeof id === 'string' && ARTICLE_ID_RE.test(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readArticle(d: Deps, token: string, id: string): Promise<{ article: WikiArticle } | { error: HttpResult }> {
+  const r = await d.fetchArticle(token, id);
+  const notFound = (why: string) => ({ error: { status: 400, body: { error: 'article_not_found', message: `${id}: ${why}` } } });
+  if (r.status === 404 || r.status === 403) return notFound('not found (or not readable for you)');
+  if (r.status !== 200 || !r.body || typeof r.body !== 'object') return { error: { status: 502, body: { error: 'wiki_unavailable' } } };
+  const a = r.body as WikiArticle;
+  return a.deleted ? notFound('deleted') : { article: a };
+}
+
+/**
+ * POST /publish { facilityId }: admins (DMs) only. Reads the facility article and its NPC articles with the DM's
+ * own token (latest versions; the wiki's status is not considered), validates them and stores the snapshot that
+ * conversations will use. Publishing unchanged article versions again changes nothing.
+ */
+export async function handlePublish(d: Deps, req: HttpRequest): Promise<HttpResult> {
+  const auth = await authenticate(d, req);
+  if (failed(auth)) return auth;
+  if (auth.identity.role !== 'admin') return { status: 403, body: { error: 'admins_only' } };
+  const id = facilityIdFrom(req.body);
+  if (!id) return { status: 400, body: { error: 'bad_request', message: 'facilityId must be an article id' } };
+  const fa = await readArticle(d, auth.token, id);
+  if ('error' in fa) return fa.error;
+  try {
+    const facility = parseFacility(fa.article);
+    const npcs = [];
+    for (const npcId of facility.npcs) {
+      const na = await readArticle(d, auth.token, npcId);
+      if ('error' in na) return na.error;
+      npcs.push(parseNpc(na.article));
+    }
+    const versions = sourceVersions(facility, npcs);
+    const current = await d.catalog.get(id);
+    if (current?.versions === versions) return { status: 200, body: { result: 'unchanged', facility: publicView(current.publication) } };
+    const publication: Publication = { facility, npcs, publishedBy: auth.identity.username, publishedAt: d.now() };
+    await d.catalog.put(id, publication, versions);
+    d.log({ msg: 'published', facility: id, by: auth.identity.sub, versions });
+    return { status: 200, body: { result: current ? 'updated' : 'published', facility: publicView(publication) } };
+  } catch (e) {
+    if (e instanceof SchemaError) return { status: 400, body: { error: 'invalid_article', message: e.message } };
+    throw e;
+  }
+}
+
+/** POST /unpublish { facilityId }: admins only. Conversations stop using the facility. */
+export async function handleUnpublish(d: Deps, req: HttpRequest): Promise<HttpResult> {
+  const auth = await authenticate(d, req);
+  if (failed(auth)) return auth;
+  if (auth.identity.role !== 'admin') return { status: 403, body: { error: 'admins_only' } };
+  const id = facilityIdFrom(req.body);
+  if (!id) return { status: 400, body: { error: 'bad_request', message: 'facilityId must be an article id' } };
+  const existed = !!(await d.catalog.get(id));
+  await d.catalog.delete(id);
+  d.log({ msg: 'unpublished', facility: id, by: auth.identity.sub });
+  return { status: 200, body: { result: existed ? 'unpublished' : 'not_published' } };
+}
+
+/** GET /facilities: every signed-in user; the public view only (no persona, knowledge or secrets). */
+export async function handleList(d: Deps, req: HttpRequest): Promise<HttpResult> {
+  const auth = await authenticate(d, req);
+  if (failed(auth)) return auth;
+  const items = (await d.catalog.list()).map(publicView).sort((a, b) => a.title.localeCompare(b.title));
+  return { status: 200, body: { items } };
 }
 
 /** $connect authorizer: consumes the ticket. Returns the identity to pass on, or null to refuse. */

@@ -79,9 +79,19 @@ export class ExtensionStack extends Stack {
       pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: false },
     });
 
+    // Published facilities and NPC snapshots (docs/articles.md). The source of truth stays in the wiki articles, so
+    // a lost table only means publishing again; prod keeps it anyway (and its backups).
+    const catalog = new ddb.TableV2(this, 'Catalog', {
+      partitionKey: { name: 'id', type: ddb.AttributeType.STRING },
+      billing: ddb.Billing.onDemand(),
+      removalPolicy: prod ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: prod },
+      deletionProtection: prod,
+    });
+
     // ---------------------------------------------------------------- functions
     const code = lambda.Code.fromAsset(join(props.repoRoot, 'dist/backend'));
-    const environment = { WIKI_ORIGIN: wiki.origin, ISSUER: wiki.issuer, CLIENT_ID: wiki.clientId, TABLE: table.tableName };
+    const environment = { WIKI_ORIGIN: wiki.origin, ISSUER: wiki.issuer, CLIENT_ID: wiki.clientId, TABLE: table.tableName, CATALOG: catalog.tableName };
     const fn = (name: string, handler: string, description: string) => {
       const logGroup = new logs.LogGroup(this, `${name}Logs`, { retention: logs.RetentionDays.ONE_MONTH, removalPolicy: RemovalPolicy.DESTROY });
       return new lambda.Function(this, name, {
@@ -98,11 +108,13 @@ export class ExtensionStack extends Stack {
         description: `persona-chat ${props.envName}: ${description}`,
       });
     };
-    const ticketFn = fn('TicketFn', 'ticket', 'POST /ticket');
+    const httpFn = fn('HttpFn', 'http', 'HTTP API (tickets, facilities)');
     const authorizerFn = fn('AuthorizerFn', 'authorize', 'WebSocket $connect authorizer');
     const wsFn = fn('WsFn', 'ws', 'WebSocket routes');
-    // Least privilege: tickets are written by one function and consumed by another; connections by the routes.
-    ticketFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:PutItem'], resources: [table.tableArn] }));
+    // Least privilege: tickets are written by one function and consumed by another; connections by the routes; only
+    // the HTTP function touches the catalog.
+    httpFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:PutItem'], resources: [table.tableArn] }));
+    httpFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:DeleteItem', 'dynamodb:Scan'], resources: [catalog.tableArn] }));
     authorizerFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:DeleteItem'], resources: [table.tableArn] }));
     wsFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:DeleteItem'], resources: [table.tableArn] }));
 
@@ -111,12 +123,15 @@ export class ExtensionStack extends Stack {
       apiName: `persona-chat-${props.envName}-ticket`,
       corsPreflight: {
         allowOrigins: [wiki.origin],
-        allowMethods: [apigw.CorsHttpMethod.POST],
-        allowHeaders: ['authorization'],
+        allowMethods: [apigw.CorsHttpMethod.GET, apigw.CorsHttpMethod.POST],
+        allowHeaders: ['authorization', 'content-type'],
         maxAge: Duration.hours(1),
       },
     });
-    http.addRoutes({ path: '/ticket', methods: [apigw.HttpMethod.POST], integration: new integrations.HttpLambdaIntegration('TicketIntegration', ticketFn) });
+    const httpIntegration = new integrations.HttpLambdaIntegration('TicketIntegration', httpFn);
+    for (const [method, path] of [[apigw.HttpMethod.POST, '/ticket'], [apigw.HttpMethod.POST, '/publish'], [apigw.HttpMethod.POST, '/unpublish'], [apigw.HttpMethod.GET, '/facilities']] as const) {
+      http.addRoutes({ path, methods: [method], integration: httpIntegration });
+    }
     const httpStage = http.defaultStage!.node.defaultChild as apigw.CfnStage;
     httpStage.defaultRouteSettings = { throttlingRateLimit: 5, throttlingBurstLimit: 10 };
     const httpLogs = new logs.LogGroup(this, 'TicketApiAccessLogs', { retention: logs.RetentionDays.ONE_MONTH, removalPolicy: RemovalPolicy.DESTROY });
@@ -158,7 +173,7 @@ export class ExtensionStack extends Stack {
     // Endpoints are only known after deployment, so the bundle reads them from here (same origin). Even a
     // tampered file could only point at hosts the wiki's CSP connect-src already allows.
     new s3deploy.BucketDeployment(this, 'DeployConfig', {
-      sources: [s3deploy.Source.jsonData('config.json', { ticketUrl: `${http.apiEndpoint}/ticket`, socketUrl: wsStage.url })],
+      sources: [s3deploy.Source.jsonData('config.json', { apiUrl: http.apiEndpoint, ticketUrl: `${http.apiEndpoint}/ticket`, socketUrl: wsStage.url })],
       destinationBucket: bundles,
       destinationKeyPrefix: `ext/${extensionId}/`,
       cacheControl: [s3deploy.CacheControl.fromString('no-cache')],
@@ -171,7 +186,8 @@ export class ExtensionStack extends Stack {
       { id: 'AwsSolutions-S1', reason: 'Bundles are public code, read only through the wiki CloudFront distribution, whose access logs cover every read.' },
     ]);
     acknowledge(table, [{ id: 'AwsSolutions-DDB3', reason: 'Tickets live 30 seconds and connections until disconnect: nothing to recover.' }]);
-    for (const f of [ticketFn, authorizerFn, wsFn]) {
+    if (!prod) acknowledge(catalog, [{ id: 'AwsSolutions-DDB3', reason: 'dev: publications are rebuilt from the wiki articles by publishing again.' }]);
+    for (const f of [httpFn, authorizerFn, wsFn]) {
       acknowledge(f, [
         { id: 'AwsSolutions-IAM4[Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]', reason: 'Writes its own logs only.' },
       ]);
@@ -188,7 +204,7 @@ export class ExtensionStack extends Stack {
     ]);
     acknowledge(wsStage, [{ id: 'AwsSolutions-APIG1', reason: 'See the WebSocket API: the route function logs instead.' }]);
     acknowledge(http, [
-      { id: 'AwsSolutions-APIG4', reason: 'POST /ticket verifies the Cognito access token itself and asks the wiki (GET /api/me) about the account.' },
+      { id: 'AwsSolutions-APIG4', reason: 'Every route verifies the Cognito access token itself and asks the wiki (GET /api/me) about the account.' },
     ]);
     // CDK-managed BucketDeployment / autoDeleteObjects custom resources.
     for (const child of this.node.children) {
