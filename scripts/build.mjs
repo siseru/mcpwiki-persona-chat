@@ -2,7 +2,7 @@
 //   ext/persona-chat/persona-chat-<hash>.js  the browser bundle, from the compiled build/src/web/extension.js; the
 //                                           file name carries the content hash (the wiki caches it as immutable)
 //   bundle.json                             { id, contract, script, integrity }: what the wiki's MCPWIKI_EXTENSIONS needs
-//   backend/index.mjs                       the Lambda handlers (esbuild; the AWS SDK comes from the Lambda runtime)
+//   backend/index.mjs                       the Lambda handlers (esbuild; most AWS SDK clients come from the Lambda runtime)
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -34,8 +34,12 @@ await build({
   platform: 'node',
   target: 'node24',
   format: 'esm',
-  external: ['@aws-sdk/*'],
+  // The Lambda runtime provides these clients; @aws-sdk/client-bedrock-agentcore is bundled (src/backend/index.ts).
+  external: ['@aws-sdk/client-dynamodb', '@aws-sdk/client-apigatewaymanagementapi', '@aws-sdk/client-bedrock-runtime'],
   legalComments: 'none',
   logLevel: 'warning',
+  // Bundled CommonJS dependencies (the AgentCore client's @smithy/* packages) call require("node:https"); an ES
+  // module has no require, so provide one. Without it the function fails at init (test/bundle.test.ts).
+  banner: { js: "import { createRequire as __pcCreateRequire } from 'node:module'; const require = __pcCreateRequire(import.meta.url);" },
 });
 console.log('backend: dist/backend/index.mjs');

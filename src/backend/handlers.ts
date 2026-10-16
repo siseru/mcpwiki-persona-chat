@@ -3,6 +3,7 @@
 import { ARTICLE_ID_RE, parseFacility, parseNpc, publicView, SchemaError, sourceVersions, type Publication, type WikiArticle } from './catalog.js';
 import { buildChat, clean, cleanReply, MAX_REPLY_CHARS, MAX_SAY_CHARS, type ChatProvider, type Turn } from './chat.js';
 import { buildPrompt, DRAFT_TOOL, DraftError, parseDraft, type LlmProvider } from './draft.js';
+import { RECALL_MAX, sessionIdOf, type MemoryProvider } from './memory.js';
 import { AuthError, type TokenVerifier } from './jwt.js';
 import { issueTicket, MAX_CONNECTION_SEC, redeemTicket, type Identity, type Session, type TicketStore } from './tickets.js';
 
@@ -23,9 +24,15 @@ export interface CatalogStore {
   list(): Promise<Publication[]>;
 }
 
+export interface Conversation {
+  turns: Turn[];
+  /** What the NPC remembered about the PC when the conversation started (recalled once, at hello). */
+  memories: string[];
+}
+
 export interface ConversationStore {
-  get(connectionId: string): Promise<Turn[]>;
-  put(connectionId: string, turns: Turn[], expiresAt: number): Promise<void>;
+  get(connectionId: string): Promise<Conversation>;
+  put(connectionId: string, conversation: Conversation, expiresAt: number): Promise<void>;
 }
 
 export interface Budget {
@@ -49,6 +56,7 @@ export interface Deps {
   llm: LlmProvider;
   chat: ChatProvider;
   conversations: ConversationStore;
+  memory: MemoryProvider;
   budget: Budget;
   send: (connectionId: string, data: unknown) => Promise<void>;
   close: (connectionId: string) => Promise<void>;
@@ -331,8 +339,18 @@ async function hello(d: Deps, connectionId: string, c: Connection) {
   const found = await npcFor(d, c.session);
   if (!found) return d.send(connectionId, { type: 'error', code: 'not_published' });
   const greeting = found.npc.greeting || '……';
-  const turns = await d.conversations.get(connectionId);
-  if (!turns.length) await d.conversations.put(connectionId, [{ role: 'assistant', text: greeting }], d.now() + CONVERSATION_TTL_SEC);
+  const conv = await d.conversations.get(connectionId);
+  if (!conv.turns.length) {
+    // A memory outage must not keep the PC out: the NPC just remembers nothing this time.
+    let memories: string[] = [];
+    try {
+      memories = await d.memory.recall({ npcId: c.session.npcId, pcId: c.session.pcId }, RECALL_MAX);
+    } catch (e) {
+      d.log({ msg: 'memory error', op: 'recall', error: e instanceof Error ? e.name : 'unknown' });
+    }
+    await d.conversations.put(connectionId, { turns: [{ role: 'assistant', text: greeting }], memories }, d.now() + CONVERSATION_TTL_SEC);
+    d.log({ msg: 'recalled', sub: c.sub, npc: c.session.npcId, pc: c.session.pcId, count: memories.length });
+  }
   return d.send(connectionId, { type: 'npc', npc: { id: found.npc.id, name: found.npc.name, role: found.npc.role }, facility: found.facility.title, text: greeting });
 }
 
@@ -347,8 +365,9 @@ async function say(d: Deps, connectionId: string, c: Connection, raw: unknown) {
   if (!(await d.budget.take(`budget#chat#${c.sub}#${day}`, SAYS_PER_DAY, 2 * 86400))) return d.send(connectionId, { type: 'error', code: 'budget_exceeded' });
   const found = await npcFor(d, c.session);
   if (!found) return d.send(connectionId, { type: 'error', code: 'not_published' });
-  const history = [...(await d.conversations.get(connectionId)), { role: 'user' as const, text }];
-  const { system, messages, boundary } = buildChat(found.facility, found.npc, c.session.pcName, history);
+  const conv = await d.conversations.get(connectionId);
+  const history = [...conv.turns, { role: 'user' as const, text }];
+  const { system, messages, boundary } = buildChat(found.facility, found.npc, c.session.pcName, history, conv.memories);
   await d.send(connectionId, { type: 'start' });
   let reply: string;
   try {
@@ -370,8 +389,16 @@ async function say(d: Deps, connectionId: string, c: Connection, raw: unknown) {
     d.log({ msg: 'model error', sub: c.sub, error: e instanceof Error ? e.name : 'unknown' });
     return d.send(connectionId, { type: 'error', code: 'model_unavailable' });
   }
-  await d.conversations.put(connectionId, [...history, { role: 'assistant', text: reply || '……' }], now + CONVERSATION_TTL_SEC);
-  return d.send(connectionId, { type: 'done', text: reply });
+  const answer = reply || '……';
+  await d.conversations.put(connectionId, { turns: [...history, { role: 'assistant', text: answer }], memories: conv.memories }, now + CONVERSATION_TTL_SEC);
+  await d.send(connectionId, { type: 'done', text: reply });
+  // The exchange goes to long-term memory after the reply is out; a failure only costs this exchange's memory.
+  try {
+    const key = { npcId: c.session.npcId, pcId: c.session.pcId, actorId: c.sub, sessionId: sessionIdOf(connectionId) };
+    await d.memory.record(key, [{ role: 'user', text }, { role: 'assistant', text: answer }]);
+  } catch (e) {
+    d.log({ msg: 'memory error', op: 'record', error: e instanceof Error ? e.name : 'unknown' });
+  }
 }
 
 /** $default route: ping / hello / say (JSON, at most 4 KB). */

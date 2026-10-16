@@ -2,10 +2,13 @@
 // Lambda runtime). Configuration: WIKI_ORIGIN, ISSUER, CLIENT_ID, TABLE (tickets, connections, budgets), CATALOG
 // (publications), MODEL_ID (Bedrock inference profile for drafts).
 import { ApiGatewayManagementApiClient, DeleteConnectionCommand, GoneException, PostToConnectionCommand } from '@aws-sdk/client-apigatewaymanagementapi';
+// Bundled (not the runtime's copy): custom namespace variables (extractionConfig) need client 3.1148+.
+import { BedrockAgentCoreClient, CreateEventCommand, ListMemoryRecordsCommand } from '@aws-sdk/client-bedrock-agentcore';
 import { BedrockRuntimeClient, ConverseCommand, ConverseStreamCommand } from '@aws-sdk/client-bedrock-runtime';
 import { ConditionalCheckFailedException, DeleteItemCommand, DynamoDBClient, GetItemCommand, PutItemCommand, ScanCommand, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
 import type { Publication } from './catalog.js';
 import type { ChatProvider, Turn } from './chat.js';
+import { namespaceOf, type MemoryProvider } from './memory.js';
 import { DraftError, type LlmProvider } from './draft.js';
 import { handleAdopt, handleAuthorize, handleConnect, handleDisconnect, handleDraft, handleList, handleMessage, handlePublish, handleTicket, handleUnpublish, type Budget, type CatalogStore, type ConversationStore, type Connection, type ConnectionStore, type Deps, type HttpRequest, type HttpResult } from './handlers.js';
 import { TokenVerifier } from './jwt.js';
@@ -107,10 +110,40 @@ const budget: Budget = {
 const conversations: ConversationStore = {
   async get(id) {
     const r = await db.send(new GetItemCommand({ TableName: TABLE, Key: { pk: { S: `conv#${id}` } }, ConsistentRead: true }));
-    return r.Item?.turns?.S ? (JSON.parse(r.Item.turns.S) as Turn[]) : [];
+    return {
+      turns: r.Item?.turns?.S ? (JSON.parse(r.Item.turns.S) as Turn[]) : [],
+      memories: r.Item?.memories?.S ? (JSON.parse(r.Item.memories.S) as string[]) : [],
+    };
   },
-  async put(id, turns, expiresAt) {
-    await db.send(new PutItemCommand({ TableName: TABLE, Item: { pk: { S: `conv#${id}` }, turns: { S: JSON.stringify(turns.slice(-40)) }, ttl: { N: String(expiresAt) } } }));
+  async put(id, conv, expiresAt) {
+    await db.send(
+      new PutItemCommand({
+        TableName: TABLE,
+        Item: { pk: { S: `conv#${id}` }, turns: { S: JSON.stringify(conv.turns.slice(-40)) }, memories: { S: JSON.stringify(conv.memories) }, ttl: { N: String(expiresAt) } },
+      }),
+    );
+  },
+};
+
+const agentcore = new BedrockAgentCoreClient({});
+const memory: MemoryProvider = {
+  async record(key, turns) {
+    await agentcore.send(
+      new CreateEventCommand({
+        memoryId: env('MEMORY_ID'),
+        actorId: key.actorId,
+        sessionId: key.sessionId,
+        eventTimestamp: new Date(),
+        payload: turns.map((t) => ({ conversational: { role: t.role === 'user' ? 'USER' : 'ASSISTANT', content: { text: t.text } } })),
+        // Resolves the strategy's namespace template /npc/{npc}/pc/{pc}/ (values validated by AgentCore too).
+        extractionConfig: { namespaceVariables: { npc: key.npcId, pc: key.pcId } },
+      }),
+      { abortSignal: AbortSignal.timeout(5000) },
+    );
+  },
+  async recall(key, max) {
+    const r = await agentcore.send(new ListMemoryRecordsCommand({ memoryId: env('MEMORY_ID'), namespace: namespaceOf(key), maxResults: max }), { abortSignal: AbortSignal.timeout(5000) });
+    return (r.memoryRecordSummaries ?? []).map((m) => m.content?.text ?? '').filter(Boolean);
   },
 };
 
@@ -202,6 +235,7 @@ const deps = (ws?: { domainName: string; stage: string }): Deps => ({
   llm,
   chat,
   conversations,
+  memory,
   budget,
   send: async (connectionId, data) => {
     try {
