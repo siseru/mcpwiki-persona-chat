@@ -1,25 +1,53 @@
 import { join } from 'node:path';
-import { CfnOutput, Duration, RemovalPolicy, Stack, type StackProps, aws_iam as iam, aws_s3 as s3, aws_s3_deployment as s3deploy } from 'aws-cdk-lib';
+import {
+  CfnOutput, Duration, RemovalPolicy, Stack, type StackProps,
+  aws_apigatewayv2 as apigw,
+  aws_apigatewayv2_authorizers as authorizers,
+  aws_apigatewayv2_integrations as integrations,
+  aws_dynamodb as ddb,
+  aws_iam as iam,
+  aws_lambda as lambda,
+  aws_logs as logs,
+  aws_s3 as s3,
+  aws_s3_deployment as s3deploy,
+} from 'aws-cdk-lib';
 import type { Construct } from 'constructs';
 import { acknowledge } from './nag.js';
+
+export interface WikiLink {
+  /** ARN of the MCPWiki CloudFront distribution that serves the bundle (the only reader of the bucket). */
+  distributionArn: string;
+  /** The wiki's origin (https://host): the only page that may ask for tickets and connect. */
+  origin: string;
+  /** Cognito issuer of the wiki's tokens (config.json "issuer"). */
+  issuer: string;
+  /** The wiki's web client id (config.json "webClientId"): tokens of any other client are refused. */
+  clientId: string;
+}
 
 export interface ExtensionStackProps extends StackProps {
   envName: 'dev' | 'prod';
   repoRoot: string;
   /** Extension id: the bundle lives under ext/<id>/ and is served by the wiki under /ext/<id>/. */
   extensionId: string;
-  /** ARN of the MCPWiki CloudFront distribution that serves the bundle (the only reader of the bucket). */
-  wikiDistributionArn: string;
+  wiki: WikiLink;
 }
 
 /**
- * The persona-chat extension for one environment. For now only the bundle bucket: MCPWiki's distribution reads
- * ext/<id>/* through OAC (MCPWiki docs/extensions.md). No CloudFormation reference links this stack to the wiki's:
- * the distribution ARN comes in as configuration, the bucket domain goes out as an output.
+ * The persona-chat extension for one environment.
+ * - Bundle bucket: MCPWiki's distribution reads ext/<id>/* through OAC (MCPWiki docs/extensions.md).
+ * - POST /ticket (HTTP API) trades the user's access token for a single-use connection ticket, after the wiki
+ *   confirmed the account (GET /api/me); the WebSocket API's $connect authorizer consumes it (docs/spike.md).
+ * No CloudFormation reference links this stack to the wiki's: the wiki's values come in as configuration, the
+ * bucket domain and endpoints go out as outputs.
  */
 export class ExtensionStack extends Stack {
   constructor(scope: Construct, id: string, props: ExtensionStackProps) {
     super(scope, id, props);
+    const { wiki, extensionId } = props;
+    const prod = props.envName === 'prod';
+
+    // ---------------------------------------------------------------- bundle bucket
     // Bundles are rebuilt from the repository: nothing in the bucket needs to survive the stack.
     const bundles = new s3.Bucket(this, 'Bundles', {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -36,10 +64,86 @@ export class ExtensionStack extends Stack {
         sid: 'WikiDistributionReadsBundles',
         principals: [new iam.ServicePrincipal('cloudfront.amazonaws.com')],
         actions: ['s3:GetObject'],
-        resources: [bundles.arnForObjects(`ext/${props.extensionId}/*`)],
-        conditions: { StringEquals: { 'AWS:SourceArn': props.wikiDistributionArn } },
+        resources: [bundles.arnForObjects(`ext/${extensionId}/*`)],
+        conditions: { StringEquals: { 'AWS:SourceArn': wiki.distributionArn } },
       }),
     );
+
+    // ---------------------------------------------------------------- state
+    // Tickets (30 s) and live connections (until $disconnect); TTL cleans up whatever is left.
+    const table = new ddb.TableV2(this, 'State', {
+      partitionKey: { name: 'pk', type: ddb.AttributeType.STRING },
+      billing: ddb.Billing.onDemand(),
+      timeToLiveAttribute: 'ttl',
+      removalPolicy: RemovalPolicy.DESTROY, // short-lived data only
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: false },
+    });
+
+    // ---------------------------------------------------------------- functions
+    const code = lambda.Code.fromAsset(join(props.repoRoot, 'dist/backend'));
+    const environment = { WIKI_ORIGIN: wiki.origin, ISSUER: wiki.issuer, CLIENT_ID: wiki.clientId, TABLE: table.tableName };
+    const fn = (name: string, handler: string, description: string) => {
+      const logGroup = new logs.LogGroup(this, `${name}Logs`, { retention: logs.RetentionDays.ONE_MONTH, removalPolicy: RemovalPolicy.DESTROY });
+      return new lambda.Function(this, name, {
+        runtime: lambda.Runtime.NODEJS_24_X,
+        architecture: lambda.Architecture.ARM_64,
+        handler: `index.${handler}`,
+        code,
+        memorySize: 256,
+        timeout: Duration.seconds(10),
+        // Caps a flood's share of the account-wide concurrency pool.
+        reservedConcurrentExecutions: prod ? 20 : 5,
+        logGroup,
+        environment,
+        description: `persona-chat ${props.envName}: ${description}`,
+      });
+    };
+    const ticketFn = fn('TicketFn', 'ticket', 'POST /ticket');
+    const authorizerFn = fn('AuthorizerFn', 'authorize', 'WebSocket $connect authorizer');
+    const wsFn = fn('WsFn', 'ws', 'WebSocket routes');
+    // Least privilege: tickets are written by one function and consumed by another; connections by the routes.
+    ticketFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:PutItem'], resources: [table.tableArn] }));
+    authorizerFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:DeleteItem'], resources: [table.tableArn] }));
+    wsFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:DeleteItem'], resources: [table.tableArn] }));
+
+    // ---------------------------------------------------------------- APIs
+    const http = new apigw.HttpApi(this, 'TicketApi', {
+      apiName: `persona-chat-${props.envName}-ticket`,
+      corsPreflight: {
+        allowOrigins: [wiki.origin],
+        allowMethods: [apigw.CorsHttpMethod.POST],
+        allowHeaders: ['authorization'],
+        maxAge: Duration.hours(1),
+      },
+    });
+    http.addRoutes({ path: '/ticket', methods: [apigw.HttpMethod.POST], integration: new integrations.HttpLambdaIntegration('TicketIntegration', ticketFn) });
+    const httpStage = http.defaultStage!.node.defaultChild as apigw.CfnStage;
+    httpStage.defaultRouteSettings = { throttlingRateLimit: 5, throttlingBurstLimit: 10 };
+    const httpLogs = new logs.LogGroup(this, 'TicketApiAccessLogs', { retention: logs.RetentionDays.ONE_MONTH, removalPolicy: RemovalPolicy.DESTROY });
+    httpStage.accessLogSettings = {
+      destinationArn: httpLogs.logGroupArn,
+      // No headers, no query strings: never the token.
+      format: JSON.stringify({ requestId: '$context.requestId', ip: '$context.identity.sourceIp', path: '$context.path', status: '$context.status', latency: '$context.responseLatency', time: '$context.requestTime' }),
+    };
+
+    const ws = new apigw.WebSocketApi(this, 'Socket', {
+      apiName: `persona-chat-${props.envName}-socket`,
+      connectRouteOptions: {
+        integration: new integrations.WebSocketLambdaIntegration('ConnectIntegration', wsFn),
+        authorizer: new authorizers.WebSocketLambdaAuthorizer('TicketAuthorizer', authorizerFn, { identitySource: ['route.request.querystring.ticket'] }),
+      },
+      disconnectRouteOptions: { integration: new integrations.WebSocketLambdaIntegration('DisconnectIntegration', wsFn) },
+      defaultRouteOptions: { integration: new integrations.WebSocketLambdaIntegration('DefaultIntegration', wsFn) },
+    });
+    const wsStage = new apigw.WebSocketStage(this, 'SocketStage', {
+      webSocketApi: ws,
+      stageName: props.envName,
+      autoDeploy: true,
+      throttle: { rateLimit: 20, burstLimit: 40 },
+    });
+    wsStage.grantManagementApiAccess(wsFn);
+
+    // ---------------------------------------------------------------- bundle + its runtime configuration
     // Old bundles stay (prune: false): the wiki keeps serving the version its configuration pins until it is
     // redeployed with the new hash.
     new s3deploy.BucketDeployment(this, 'DeployBundle', {
@@ -51,9 +155,40 @@ export class ExtensionStack extends Stack {
       prune: false,
       memoryLimit: 256,
     });
+    // Endpoints are only known after deployment, so the bundle reads them from here (same origin). Even a
+    // tampered file could only point at hosts the wiki's CSP connect-src already allows.
+    new s3deploy.BucketDeployment(this, 'DeployConfig', {
+      sources: [s3deploy.Source.jsonData('config.json', { ticketUrl: `${http.apiEndpoint}/ticket`, socketUrl: wsStage.url })],
+      destinationBucket: bundles,
+      destinationKeyPrefix: `ext/${extensionId}/`,
+      cacheControl: [s3deploy.CacheControl.fromString('no-cache')],
+      prune: false,
+      memoryLimit: 256,
+    });
 
+    // ---------------------------------------------------------------- cdk-nag
     acknowledge(bundles, [
       { id: 'AwsSolutions-S1', reason: 'Bundles are public code, read only through the wiki CloudFront distribution, whose access logs cover every read.' },
+    ]);
+    acknowledge(table, [{ id: 'AwsSolutions-DDB3', reason: 'Tickets live 30 seconds and connections until disconnect: nothing to recover.' }]);
+    for (const f of [ticketFn, authorizerFn, wsFn]) {
+      acknowledge(f, [
+        { id: 'AwsSolutions-IAM4[Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]', reason: 'Writes its own logs only.' },
+      ]);
+    }
+    acknowledge(wsFn, [
+      {
+        id: `AwsSolutions-IAM5[Resource::arn:aws:execute-api:${this.region}:${this.account}:<${this.getLogicalId(ws.node.defaultChild as apigw.CfnApi)}>/${props.envName}/*/@connections/*]`,
+        reason: 'Posts to / closes any connection of its own WebSocket stage.',
+      },
+    ]);
+    acknowledge(ws, [
+      { id: 'AwsSolutions-APIG4', reason: '$connect has the ticket authorizer; $default and $disconnect only run on an authorized connection.' },
+      { id: 'AwsSolutions-APIG1', reason: 'WebSocket access logging needs the account-wide API Gateway CloudWatch role, which this stack does not own; the route function logs connect, disconnect and refusals.' },
+    ]);
+    acknowledge(wsStage, [{ id: 'AwsSolutions-APIG1', reason: 'See the WebSocket API: the route function logs instead.' }]);
+    acknowledge(http, [
+      { id: 'AwsSolutions-APIG4', reason: 'POST /ticket verifies the Cognito access token itself and asks the wiki (GET /api/me) about the account.' },
     ]);
     // CDK-managed BucketDeployment / autoDeleteObjects custom resources.
     for (const child of this.node.children) {
@@ -69,7 +204,12 @@ export class ExtensionStack extends Stack {
         { id: 'AwsSolutions-L1', reason: 'CDK-managed custom resource runtime.' },
       ]);
     }
-    // Not an export (see the class comment): copied into the wiki's MCPWIKI_EXTENSIONS by hand.
+
+    // Not exports (see the class comment): copied into the wiki's MCPWIKI_EXTENSIONS by hand.
     new CfnOutput(this, 'BundleBucketDomain', { value: bundles.bucketRegionalDomainName, description: 'bucketRegionalDomainName for the wiki configuration' });
+    new CfnOutput(this, 'ConnectSrc', {
+      value: `https://${http.apiId}.execute-api.${this.region}.amazonaws.com wss://${ws.apiId}.execute-api.${this.region}.amazonaws.com`,
+      description: 'connectSrc for the wiki configuration',
+    });
   }
 }

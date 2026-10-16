@@ -14,7 +14,7 @@
   },
   "scripts": {
     "build:ts": "tsc -p tsconfig.json",
-    "build:bundle": "node scripts/build-bundle.mjs",
+    "build:bundle": "node scripts/build.mjs",
     "build": "npm run build:ts && npm run build:bundle",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "node scripts/lint.mjs",
@@ -23,11 +23,14 @@
     "deploy:dev": "npm run build && cdk deploy PersonaChat-dev"
   },
   "devDependencies": {
+    "@aws-sdk/client-apigatewaymanagementapi": "^3.1148.0",
+    "@aws-sdk/client-dynamodb": "^3.1148.0",
     "@types/node": "^24.19.1",
     "aws-cdk": "^2.1145.0",
     "aws-cdk-lib": "^2.272.0",
     "cdk-nag": "^3.0.2",
     "constructs": "^10.8.1",
+    "esbuild": "^0.28.2",
     "typescript": "~7.0.2"
   }
 }

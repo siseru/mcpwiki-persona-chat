@@ -50,7 +50,7 @@ jobs:
     env:
       CDK_DEFAULT_ACCOUNT: '123456789012'
       CDK_DEFAULT_REGION: us-west-2
-      PERSONACHAT_WIKI: '{"dev":{"distributionArn":"arn:aws:cloudfront::123456789012:distribution/E1EXAMPLE12345"}}'
+      PERSONACHAT_WIKI: '{"dev":{"distributionArn":"arn:aws:cloudfront::123456789012:distribution/E1EXAMPLE12345","origin":"https://wiki-dev.example.com","issuer":"https://cognito-idp.us-west-2.amazonaws.com/us-west-2_EXAMPLE12","clientId":"exampleclientid0123456789ab"}}'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

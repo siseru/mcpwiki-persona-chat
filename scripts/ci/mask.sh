@@ -14,9 +14,10 @@ mask "${AWS_ACCOUNT_ID:-}"
 mask "${ALARM_EMAIL:-}"
 # ... and with punctuation dropped (the form CDK's EmailSubscription used in logical ids).
 mask "$(printf '%s' "${ALARM_EMAIL:-}" | tr -cd 'A-Za-z0-9')"
-# The wiki each environment plugs into: distribution ARNs and their ids.
+# The wiki each environment plugs into: distribution ARNs and ids, issuers and user pool ids, origins, client ids.
 if [ -n "${PERSONACHAT_WIKI:-}" ]; then
-  while IFS= read -r v; do mask "$v"; mask "${v##*/}"; done < <(jq -r '[.[]?.distributionArn // empty] | .[]' <<< "$PERSONACHAT_WIKI")
+  while IFS= read -r v; do mask "$v"; mask "${v##*/}"; done < <(jq -r '[.[]? | .distributionArn, .issuer | strings] | .[]' <<< "$PERSONACHAT_WIKI")
+  while IFS= read -r v; do mask "$v"; mask "${v#https://}"; done < <(jq -r '[.[]? | .origin, .clientId | strings] | .[]' <<< "$PERSONACHAT_WIKI")
 fi
 IFS=',' read -ra extras <<< "${REDACT_EXTRA:-}"
 for v in "${extras[@]}"; do

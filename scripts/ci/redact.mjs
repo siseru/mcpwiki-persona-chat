@@ -24,14 +24,16 @@ for (const item of (process.env.REDACT_EXTRA ?? '').split(',')) {
   }
 }
 
-// The wiki each environment plugs into (PERSONACHAT_WIKI): distribution ARNs and ids.
+// The wiki each environment plugs into (PERSONACHAT_WIKI): distribution ARNs / ids, issuers / user pool ids, hosts, client ids.
 try {
   for (const w of Object.values(JSON.parse(process.env.PERSONACHAT_WIKI || '{}') ?? {})) {
-    const arn = w?.distributionArn;
-    if (typeof arn === 'string') {
-      add(arn);
-      add(arn.slice(arn.lastIndexOf('/') + 1));
+    for (const v of [w?.distributionArn, w?.issuer]) {
+      if (typeof v !== 'string') continue;
+      add(v);
+      add(v.slice(v.lastIndexOf('/') + 1)); // distribution id / user pool id
     }
+    if (typeof w?.origin === 'string') add(w.origin.replace(/^https:\/\//, ''));
+    add(w?.clientId);
   }
 } catch {
   console.error('redact: PERSONACHAT_WIKI is not valid JSON; only generic patterns are applied');

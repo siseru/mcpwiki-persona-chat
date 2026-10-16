@@ -40,32 +40,37 @@ node scripts/bootstrap-dev.mjs
 
 ## 拡張のスタック（dev）
 
-拡張のスタック `PersonaChat-dev` は、ガードと dev 用の bootstrap の後に配備します。今は、バンドルを置くバケットだけのスタックです。MCPWiki の配信が、このバケットの `ext/persona-chat/*` を OAC で読みます（MCPWiki の docs/extensions.md）。
+拡張のスタック `PersonaChat-dev` は、ガードと dev 用の bootstrap の後に配備します。中身は次のとおりです。
+
+- バンドルを置くバケット。MCPWiki の配信が、このバケットの `ext/persona-chat/*` を OAC で読みます（MCPWiki の docs/extensions.md）。
+- `POST /ticket`（HTTP API）。利用者のアクセストークンを検証し、MCPWiki の `/api/me` で利用者が有効かを確かめてから、30 秒で失効する 1 回限りのチケットを発行します。
+- WebSocket API。`$connect` のオーソライザがチケットを消費します（docs/spike.md の 4）。
 
 2 つのスタックは、CloudFormation の参照でつなぎません。互いの値は設定として渡します。
 
 | 向き | 値 | 置き場所 |
 |---|---|---|
-| MCPWiki から拡張へ | MCPWiki の配信の ARN | `config/wiki.local.json`（Git の管理外）。CI ではシークレット `PERSONACHAT_WIKI` |
-| 拡張から MCPWiki へ | バケットのドメイン、バンドルのファイル名、SRI | MCPWiki のシークレット `MCPWIKI_EXTENSIONS` |
+| MCPWiki から拡張へ | 配信の ARN、Wiki のオリジン、Cognito の issuer、Web クライアントの ID | `config/wiki.local.json`（Git の管理外。形は `config/wiki.example.json`）。CI ではシークレット `PERSONACHAT_WIKI` |
+| 拡張から MCPWiki へ | バケットのドメイン、バンドルのファイル名、SRI、接続先（`connectSrc`） | MCPWiki のシークレット `MCPWIKI_EXTENSIONS` |
 
 ```bash
-# 1. MCPWiki の dev の配信の ARN を、Git の管理外のファイルに書く
+# 1. MCPWiki の dev の値を、Git の管理外のファイルに書く（issuer と clientId は、Wiki の /config.json の issuer と webClientId）
 D=$(aws cloudformation describe-stack-resource --region us-west-2 --stack-name MCPWiki-dev --logical-resource-id Cdn9963B1AD --query StackResourceDetail.PhysicalResourceId --output text)
 A=$(aws sts get-caller-identity --query Account --output text)
-printf '{"dev":{"distributionArn":"arn:aws:cloudfront::%s:distribution/%s"}}\n' "$A" "$D" > config/wiki.local.json
+H=wiki-dev.example.com   # Wiki の dev のホスト名
+curl -s https://$H/config.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const c=JSON.parse(s);console.log(JSON.stringify({dev:{distributionArn:`arn:aws:cloudfront::${process.argv[1]}:distribution/${process.argv[2]}`,origin:`https://${process.argv[3]}`,issuer:c.issuer,clientId:c.webClientId}}))})' "$A" "$D" "$H" > config/wiki.local.json
 
 # 2. バンドルを作り、拡張のスタックを配備する（境界つきの pcdev の bootstrap を使う）
 npm run deploy:dev
 
-# 3. MCPWiki に渡す値（バケットのドメインは、スタックの出力 BundleBucketDomain）
+# 3. MCPWiki に渡す値（バケットのドメインはスタックの出力 BundleBucketDomain、接続先は ConnectSrc）
 cat dist/bundle.json
 ```
 
 続けて、MCPWiki のシークレット `MCPWIKI_EXTENSIONS` を、次の形で設定します。設定したら、MCPWiki の Deploy ワークフローを、main で実行し直します（Actions の画面の「Run workflow」）。
 
 ```json
-{"dev":[{"id":"persona-chat","contract":1,"bucketRegionalDomainName":"<BundleBucketDomain>","script":"<bundle.json の script>","integrity":"<bundle.json の integrity>","connectSrc":[]}]}
+{"dev":[{"id":"persona-chat","contract":1,"bucketRegionalDomainName":"<BundleBucketDomain>","script":"<bundle.json の script>","integrity":"<bundle.json の integrity>","connectSrc":["<ConnectSrc の 1 つ目>","<ConnectSrc の 2 つ目>"]}]}
 ```
 
 **外すとき**

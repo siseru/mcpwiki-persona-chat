@@ -19,7 +19,7 @@ function devStack() {
     envName: 'dev',
     repoRoot,
     extensionId: 'persona-chat',
-    wikiDistributionArn: ARN,
+    wiki: { distributionArn: ARN, origin: 'https://wiki-dev.example.com', issuer: 'https://cognito-idp.us-west-2.amazonaws.com/us-west-2_EXAMPLE12', clientId: 'exampleclientid0123456789ab' },
     synthesizer: new DefaultStackSynthesizer({ qualifier: DEV_QUALIFIER }),
     permissionsBoundary: PermissionsBoundary.fromName(DEV_BOUNDARY_NAME),
   });
@@ -60,4 +60,27 @@ test('the built bundle matches its SRI hash and content-hashed file name, and re
   assert.ok(!text.includes('__BUILD__'));
   // Runs inside the wiki's origin: no HTML strings, no storage.
   assert.ok(!/innerHTML|outerHTML|insertAdjacentHTML|document\.write|localStorage|sessionStorage|eval\(/.test(text));
+});
+
+test('the ticket API answers the wiki page only, the socket needs a ticket, and functions get least privilege', () => {
+  const { Resources } = devStack();
+  const of = (type: string) => Object.entries(Resources).filter(([, r]) => r.Type === type);
+  const [[, httpApi]] = of('AWS::ApiGatewayV2::Api').filter(([, r]) => r.Properties.ProtocolType === 'HTTP') as [string, any][];
+  assert.deepEqual(httpApi.Properties.CorsConfiguration.AllowOrigins, ['https://wiki-dev.example.com']);
+  const [[, auth]] = of('AWS::ApiGatewayV2::Authorizer') as [string, any][];
+  assert.deepEqual(auth.Properties.IdentitySource, ['route.request.querystring.ticket']);
+  const connect = of('AWS::ApiGatewayV2::Route').map(([, r]) => r.Properties).find((p) => p.RouteKey === '$connect')!;
+  assert.equal(connect.AuthorizationType, 'CUSTOM');
+  // Access logs never include headers or query strings (the token / ticket).
+  for (const [, st] of of('AWS::ApiGatewayV2::Stage')) {
+    const fmt = st.Properties.AccessLogSettings?.Format as string | undefined;
+    if (fmt) assert.ok(!/header|querystring|authorizer/i.test(fmt), fmt);
+  }
+  // DynamoDB actions per function: tickets are written by one function and consumed by another.
+  const actions = of('AWS::IAM::Policy')
+    .map(([, p]) => (p.Properties.PolicyDocument.Statement as any[]).flatMap((s) => [s.Action].flat()).filter((a: string) => a.startsWith('dynamodb:')).sort())
+    .filter((a) => a.length)
+    .map((a) => a.join(','))
+    .sort();
+  assert.deepEqual(actions, ['dynamodb:DeleteItem', 'dynamodb:DeleteItem,dynamodb:GetItem,dynamodb:PutItem', 'dynamodb:PutItem']);
 });
