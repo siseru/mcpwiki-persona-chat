@@ -608,6 +608,7 @@ test("each NPC recalls what it remembers about this PC; nothing of another PC's 
   const system = s.chatCalls[0]!.system;
   assert.match(system, /What ミナト remembers about アリス from earlier visits/);
   assert.match(system, /mention only what the notes above say; never make up past events/);
+  assert.match(system, /Use a remembered fact only when it fits the conversation naturally/);
   assert.match(system, /<<PLAYER-[0-9a-f]{24}\n- ユーザーは祭りまでに竜の鱗を持ってくると約束した\nPLAYER-[0-9a-f]{24}>>/);
   assert.ok(!system.includes('ボブ'));
   assert.deepEqual(s.memory.recorded[0]!.key, { npcId: 'minato', pcId: 'pc-alice', actorId: 'sub-alice', sessionId: sessionIdOf('c1') });

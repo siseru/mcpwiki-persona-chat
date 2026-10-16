@@ -52,6 +52,8 @@ export function buildChat(facility: FacilitySnapshot, npc: NpcSnapshot, pcName: 
     '  events, rumours with specifics, jobs or rewards, and never claim facts about the world that are not given above.',
     `  When asked about such things, ${npc.name} does not know details: answer vaguely in character (e.g. "I couldn't say").`,
     `- About earlier visits of ${pcName}, mention only what the notes above say; never make up past events or orders.`,
+    '  Use a remembered fact only when it fits the conversation naturally; never force one into a reply.',
+    '- Keep each reply coherent: reasons must actually support what you say, and later sentences must not contradict earlier ones.',
   ];
   const fence = (t: Turn): Turn => (t.role === 'user' ? { role: 'user', text: `<<${boundary}\n${t.text}\n${boundary}>>` } : t);
   return { system: lines.filter(Boolean).join('\n'), messages: history.slice(-HISTORY_TURNS).map(fence), boundary };
