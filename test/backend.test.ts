@@ -292,7 +292,7 @@ test('the article is fenced as untrusted data and cannot fake its own end', () =
 test('broken model output is rejected, not passed on', async () => {
   const outputs: unknown[] = [
     'not an object', [], { ...(goodDraft() as object), name: { value: 3 } }, { ...(goodDraft() as object), persona: q('x'.repeat(2001)) },
-    { ...(goodDraft() as object), knowledge: 'x' }, { ...(goodDraft() as object), greeting: q('') }, new (await import('../src/backend/draft.js')).DraftError('no tool call'),
+    { ...(goodDraft() as object), knowledge: 'x' }, { ...(goodDraft() as object), role: q('') }, new (await import('../src/backend/draft.js')).DraftError('no tool call'),
   ];
   for (const out of outputs) {
     const s = setup(ADMIN, { 'harbor-town': lore });
@@ -301,6 +301,16 @@ test('broken model output is rejected, not passed on', async () => {
     assert.equal(r.status, 502, JSON.stringify(out).slice(0, 60));
     assert.equal(r.body.error, 'draft_invalid');
   }
+  // Voice and greeting may come back empty (optional fields, left to the DM).
+  const empty = setup(ADMIN, { 'harbor-town': lore });
+  empty.setLlm({ ...(goodDraft() as object), voice: q(''), greeting: q('') });
+  assert.equal((await handleDraft(empty.d, post({ articleId: 'harbor-town' }))).status, 200);
+  // Model errors (throttling, rejected parameters) become a 502 with the error name in the log only.
+  const down = setup(ADMIN, { 'harbor-town': lore });
+  down.setLlm(Object.assign(new Error('The model returned the following errors: ...'), { name: 'ValidationException' }));
+  const dr = await handleDraft(down.d, post({ articleId: 'harbor-town' }));
+  assert.deepEqual([dr.status, dr.body.error], [502, 'model_unavailable']);
+  assert.ok(down.logs.some((l) => l.error === 'ValidationException'));
   // Extra entries beyond the limits are dropped; control characters are removed.
   const s = setup(ADMIN, { 'harbor-town': lore });
   s.setLlm({ ...(goodDraft() as object), name: q('ミ\u202eナト'), secrets: Array.from({ length: 9 }, (_, i) => q(`秘密${i}`)) });

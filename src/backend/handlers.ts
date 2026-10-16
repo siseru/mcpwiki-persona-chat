@@ -199,8 +199,19 @@ export async function handleDraft(d: Deps, req: HttpRequest): Promise<HttpResult
   }
   const article = { title: read.article.title, body: read.article.body ?? '' };
   const { system, user } = buildPrompt(article);
+  let r: Awaited<ReturnType<LlmProvider['draft']>>;
   try {
-    const r = await d.llm.draft({ system, user, tool: DRAFT_TOOL, maxTokens: 2000 });
+    r = await d.llm.draft({ system, user, tool: DRAFT_TOOL, maxTokens: 2000 });
+  } catch (e) {
+    if (e instanceof DraftError) {
+      d.log({ msg: 'draft rejected', by: auth.identity.sub, article: id, reason: e.message });
+      return { status: 502, body: { error: 'draft_invalid', message: 'the model returned an unusable draft; try again' } };
+    }
+    // Model errors (throttling, validation, timeouts) are reported, not thrown: the name only, never the prompt.
+    d.log({ msg: 'model error', by: auth.identity.sub, article: id, error: e instanceof Error ? e.name : 'unknown' });
+    return { status: 502, body: { error: 'model_unavailable', message: 'the model could not be called; try again later' } };
+  }
+  try {
     const draft = parseDraft(r.input, `${article.title}\n${article.body}`);
     d.log({ msg: 'draft', by: auth.identity.sub, article: id, inputTokens: r.inputTokens, outputTokens: r.outputTokens });
     return { status: 200, body: { draft, source: { id, title: article.title, version: read.article.version } } };

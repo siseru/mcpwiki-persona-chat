@@ -111,7 +111,8 @@ const llm: LlmProvider = {
         modelId: env('MODEL_ID'),
         system: [{ text: system }],
         messages: [{ role: 'user', content: [{ text: user }] }],
-        inferenceConfig: { maxTokens, temperature: 0.7 },
+        // No temperature: current Claude models on Bedrock reject it ("deprecated for this model").
+        inferenceConfig: { maxTokens },
         toolConfig: { tools: [{ toolSpec: { name: tool.name, description: tool.description, inputSchema: { json: tool.schema as never } } }], toolChoice: { tool: { name: tool.name } } },
       }),
       { abortSignal: AbortSignal.timeout(25_000) },
