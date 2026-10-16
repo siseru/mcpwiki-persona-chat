@@ -58,6 +58,7 @@ for (const envName of ['dev', 'prod'] as const) {
     repoRoot,
     extensionId: 'persona-chat',
     wiki: link,
+    draftModel: (app.node.tryGetContext('draftModel') as string | undefined) ?? 'us.anthropic.claude-haiku-5-5',
     // dev uses its own CDK bootstrap (qualifier pcdev) whose roles carry the dev permissions boundary.
     ...(envName === 'dev'
       ? { synthesizer: new DefaultStackSynthesizer({ qualifier: DEV_QUALIFIER }), permissionsBoundary: PermissionsBoundary.fromName(DEV_BOUNDARY_NAME) }

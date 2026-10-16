@@ -116,6 +116,117 @@ async function facilitySlot(ctx: HostContext, el: HTMLElement) {
   box.append(text('p', 'DM 向け: 公開すると、この記事と NPC の記事の今の内容が会話に使われます。記事を直したら、もう一度公開してください。', 'muted'), publish, unpublish, message);
 }
 
+interface DraftField {
+  value: string;
+  basis: { kind: 'article'; quote: string } | { kind: 'invented' };
+}
+interface Draft {
+  name: DraftField;
+  role: DraftField;
+  persona: DraftField;
+  voice: DraftField;
+  greeting: DraftField;
+  knowledge: DraftField[];
+  secrets: (DraftField & { reveal: { afterVisits: number } })[];
+}
+
+const basisNote = (f: DraftField) =>
+  text('small', f.basis.kind === 'article' ? `記事に基づく:「${f.basis.quote}」` : '補った設定（記事にはありません）', f.basis.kind === 'article' ? 'muted' : 'invented');
+
+function input(label: string, value: string, opts: { multiline?: boolean; note?: HTMLElement } = {}) {
+  const box = document.createElement('label');
+  box.className = 'field';
+  const el = document.createElement(opts.multiline ? 'textarea' : 'input') as HTMLInputElement | HTMLTextAreaElement;
+  el.value = value;
+  if (opts.multiline) (el as HTMLTextAreaElement).rows = 3;
+  box.append(text('span', label), el);
+  if (opts.note) box.append(opts.note);
+  return { box, get: () => el.value.trim() };
+}
+
+/**
+ * For DMs (admins), below any article that is not an NPC: ask for an NPC draft based on it, edit it, adopt it.
+ * Adopting creates an admin-only NPC article (status draft) in the wiki; publishing stays a separate step.
+ */
+function draftPanel(ctx: HostContext, el: HTMLElement) {
+  const article = ctx.article!;
+  const box = document.createElement('div');
+  const message = text('p', '', 'muted');
+  const start = text('button', 'この記事から NPC の下書きを作る') as HTMLButtonElement;
+  start.className = 'secondary';
+  box.append(start, message);
+  el.append(box);
+  start.addEventListener('click', async () => {
+    start.disabled = true;
+    message.textContent = '下書きを作っています（10〜20 秒ほどかかります）…';
+    try {
+      const r = await api<{ draft?: Draft; message?: string; error?: string }>(ctx, 'POST', '/draft', { articleId: article.id });
+      if (r.status !== 200 || !r.body.draft) return void (message.textContent = `作れませんでした: ${r.body.message ?? r.body.error ?? `HTTP ${r.status}`}`);
+      message.textContent = '下書きです。直してから「採用」を押すと、管理者だけが読める NPC の記事（下書き）ができます。会話の場には、自動では出ません。';
+      box.append(draftForm(ctx, r.body.draft));
+    } finally {
+      start.disabled = false;
+    }
+  });
+}
+
+function draftForm(ctx: HostContext, d: Draft): HTMLElement {
+  const form = document.createElement('div');
+  form.className = 'npc-draft';
+  const id = input('新しい記事の ID（英小文字・数字・-）', '');
+  const title = input('記事のタイトル', d.name.value);
+  const name = input('名前', d.name.value, { note: basisNote(d.name) });
+  const role = input('役割', d.role.value, { note: basisNote(d.role) });
+  const persona = input('人格', d.persona.value, { multiline: true, note: basisNote(d.persona) });
+  const voice = input('口調', d.voice.value, { note: basisNote(d.voice) });
+  const greeting = input('挨拶', d.greeting.value, { note: basisNote(d.greeting) });
+  const knowledgeNotes = document.createElement('div');
+  for (const k of d.knowledge) knowledgeNotes.append(document.createElement('br'), basisNote(k));
+  const knowledge = input('知っていること（1 行に 1 つ）', d.knowledge.map((k) => k.value).join('\n'), { multiline: true, note: knowledgeNotes });
+  const background = input('背景（記事の本文になります）', '', { multiline: true });
+  const secrets = d.secrets.map((s, i) => {
+    const keep = document.createElement('input');
+    keep.type = 'checkbox';
+    const visits = document.createElement('input');
+    visits.type = 'number';
+    visits.min = '1';
+    visits.max = '100';
+    visits.value = String(s.reveal.afterVisits);
+    const t = input(`秘密の候補 ${i + 1}（採用するものだけ「残す」に印を付けます）`, s.value, { multiline: true, note: basisNote(s) });
+    const row = document.createElement('div');
+    row.className = 'secret';
+    const keepLabel = document.createElement('label');
+    keepLabel.append(keep, ' 残す');
+    const visitsLabel = document.createElement('label');
+    visitsLabel.append('話すのは、訪問 ', visits, ' 回目から');
+    row.append(t.box, keepLabel, ' ', visitsLabel);
+    return { row, get: () => (keep.checked ? { text: t.get(), reveal: { afterVisits: Number(visits.value) } } : null) };
+  });
+  const adopt = text('button', '採用して NPC の記事を作る') as HTMLButtonElement;
+  const result = text('p', '', 'muted');
+  adopt.addEventListener('click', async () => {
+    adopt.disabled = true;
+    result.textContent = '記事を作っています…';
+    try {
+      const npc = {
+        name: name.get(), role: role.get(), persona: persona.get(), voice: voice.get(), greeting: greeting.get(),
+        knowledge: knowledge.get().split('\n').map((s) => s.trim()).filter(Boolean),
+        secrets: secrets.map((s) => s.get()).filter((s): s is NonNullable<typeof s> => !!s && !!s.text),
+      };
+      const r = await api<{ id?: string; message?: string; error?: string }>(ctx, 'POST', '/adopt', { id: id.get(), title: title.get(), sourceArticleId: ctx.article!.id, npc, background: background.get() });
+      if (r.status !== 201) return void (result.textContent = `作れませんでした: ${r.body.message ?? r.body.error ?? `HTTP ${r.status}`}`);
+      result.textContent = '';
+      const a = text('a', `NPC の記事「${title.get()}」を作りました（下書き・管理者のみ）。`);
+      a.setAttribute('href', `/wiki/${r.body.id}`);
+      result.append(a, ' 施設の記事の npcs に入れて公開すると、会話に出ます。');
+    } finally {
+      adopt.disabled = false;
+    }
+  });
+  form.append(id.box, title.box, name.box, role.box, persona.box, voice.box, greeting.box, knowledge.box, ...secrets.map((s) => s.row), background.box, adopt, result);
+  return form;
+}
+
 /** The list of published facilities, for everyone. */
 async function facilityList(ctx: HostContext, el: HTMLElement) {
   const r = await api<{ items: PublicFacility[] }>(ctx, 'GET', '/facilities');
@@ -179,8 +290,10 @@ if (host?.contracts.includes(CONTRACT)) {
     id: EXTENSION_ID,
     contract: CONTRACT,
     title: 'Persona Chat',
-    articleSlot(ctx, el) {
-      if (ctx.article && FACILITY_TYPES.includes(ctx.article.type)) return facilitySlot(ctx, el);
+    async articleSlot(ctx, el) {
+      if (!ctx.article) return;
+      if (FACILITY_TYPES.includes(ctx.article.type)) await facilitySlot(ctx, el);
+      if (ctx.me.role === 'admin' && ctx.article.type !== 'NPC') draftPanel(ctx, el);
     },
     page(ctx, el, subpath) {
       const out = document.createElement('ul');
