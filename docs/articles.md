@@ -1,0 +1,81 @@
+# 会話の場と NPC の書き方
+
+persona-chat の会話の場（施設・組織）と NPC は、MCPWiki の記事に書きます。拡張は、DM（Wiki の管理者）が「公開」したときの記事の内容だけを使います。記事を直しても、公開し直すまで会話には反映されません。
+
+- 記事の中身（人格、秘密、世界設定）は Wiki の中にあり、このリポジトリには入りません。
+- 拡張用の項目は、記事の `extra` の `persona_chat` にまとめて書きます。MCPWiki の Web の編集画面では `extra` を編集できないので、**OKF の ZIP のインポート**（管理 → OKF）か、REST API で書きます。
+
+## 施設・組織（`type: Facility` か `Organization`）
+
+| 項目 | 必須 | 内容 |
+|---|---|---|
+| `capacity` | ○ | 定員（1〜20 の整数）。定員 1 の施設は、同時に 1 人だけ入れます |
+| `hours` | | 営業時間の説明（40 文字まで。例: `18:00-02:00`） |
+| `npcs` | ○ | この場にいる NPC の記事 ID（1〜5 件） |
+
+施設の記事は、だれでも読める範囲（`read_scope: all`）で構いません。一覧には、名前、定員、営業時間、NPC の名前と役割だけが出ます。
+
+## NPC（`type: NPC`）
+
+**NPC の記事は、必ず `read_scope: admin` にしてください。** 人格や秘密を含むためです。管理者以外も読める NPC の記事は、公開のときに拒否されます。
+
+| 項目 | 必須 | 内容 |
+|---|---|---|
+| `name` | ○ | 名前（60 文字まで） |
+| `role` | ○ | 役割（100 文字まで。例: 店主） |
+| `persona` | ○ | 人格（2,000 文字まで） |
+| `voice` | | 口調（500 文字まで） |
+| `knowledge` | | 知っていること（300 文字までを 20 件まで） |
+| `secrets` | | 秘密（10 件まで）。`text`（500 文字まで）と、開示の条件 `reveal` を書きます |
+| `greeting` | | 最初の挨拶（300 文字まで） |
+
+記事の本文は、NPC が知っている背景として使います（8,000 文字まで）。
+
+**秘密の開示の条件**（`reveal`）は、少なくとも 1 つ書きます。条件を判定するのはサーバで、LLM ではありません（判定の実装は、今後のタスクです）。
+
+| 条件 | 内容 |
+|---|---|
+| `afterVisits` | その PC が、この NPC を何回訪ねたら話すか（1〜100） |
+| `keywords` | 会話にこの言葉が出たら話すか（40 文字までを 10 件まで） |
+
+## 例
+
+[examples/harbor-inn](../examples/harbor-inn) に、架空の宿「港の宿」と店主「ミナト」の記事があります。MCPWiki の OKF のバンドルの形です。
+
+```yaml
+---
+type: NPC
+title: 店主ミナト
+persona_chat:
+  name: ミナト
+  role: 港の宿の店主
+  persona: 面倒見がよく、噂話が好き。
+  secrets:
+    - text: 地下の倉庫に、預かりものの荷を隠している。
+      reveal:
+        afterVisits: 3
+mcpwiki:
+  id: minato
+  read_scope: admin
+  write_scope: admin
+---
+```
+
+**取り込み方**
+
+```bash
+cd examples/harbor-inn
+zip -r ../harbor-inn.zip index.md wiki
+# zip がない場合: python3 -c 'import shutil; shutil.make_archive("../harbor-inn", "zip", ".")'
+```
+
+できた `harbor-inn.zip` を、MCPWiki の「管理 → OKF」の「インポート」で取り込みます。同じ ID の記事があれば、更新になります。
+
+## 公開する
+
+1. 施設の記事を開きます。記事の下に「会話の場」の欄が出ます。
+2. 「公開する／更新する」を押します。DM 本人の権限で、施設と NPC の記事が読まれ、内容が検証されます。
+3. 問題があれば、その場で理由が出ます。例: 「minato: an NPC article must be readable by admins only (readScope: admin)」。
+4. 公開した場は、拡張の画面（サイドバーの「Persona Chat」）の一覧に出ます。
+
+記事を直したら、もう一度「公開する／更新する」を押します。内容が同じなら「変更がないので、そのままです」と出て、何も変わりません。「公開をやめる」で、会話の場から外せます。

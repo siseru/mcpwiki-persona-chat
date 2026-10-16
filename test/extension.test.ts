@@ -82,5 +82,9 @@ test('the ticket API answers the wiki page only, the socket needs a ticket, and 
     .filter((a) => a.length)
     .map((a) => a.join(','))
     .sort();
-  assert.deepEqual(actions, ['dynamodb:DeleteItem', 'dynamodb:DeleteItem,dynamodb:GetItem,dynamodb:PutItem', 'dynamodb:PutItem']);
+  assert.deepEqual(actions, ['dynamodb:DeleteItem', 'dynamodb:DeleteItem,dynamodb:GetItem,dynamodb:PutItem', 'dynamodb:DeleteItem,dynamodb:GetItem,dynamodb:PutItem,dynamodb:PutItem,dynamodb:Scan']);
+  // The catalog is touched by the HTTP function only, and nothing may scan the ticket / connection table.
+  const statements = of('AWS::IAM::Policy').flatMap(([, p]) => p.Properties.PolicyDocument.Statement as any[]);
+  const catalogLogical = of('AWS::DynamoDB::GlobalTable').find(([k]) => k.startsWith('Catalog'))![0];
+  for (const st of statements.filter((s) => [s.Action].flat().includes('dynamodb:Scan'))) assert.ok(JSON.stringify(st.Resource).includes(catalogLogical), JSON.stringify(st.Resource));
 });
