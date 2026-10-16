@@ -178,7 +178,9 @@ async function enterPanel(ctx: HostContext, el: HTMLElement, f: PublicFacility) 
     });
     el.append(text('p', 'この場に入るには、あなたの PC（プレイヤーキャラクター）の記事が必要です。'), pick.box, use, note, text('p', 'または、新しく作ります:', 'muted'));
   }
-  if (!pcs.length) {
+  // A new PC can always be made (a player may have several characters).
+  const createForm = () => {
+    const box = document.createElement('div');
     const name = input('PC の名前', '');
     const intro = input('PC の紹介（記事の本文になります。ほかの利用者も読めます）', '', { multiline: true, rows: 3 });
     const make = text('button', 'PC の記事を作る') as HTMLButtonElement;
@@ -191,8 +193,12 @@ async function enterPanel(ctx: HostContext, el: HTMLElement, f: PublicFacility) 
       if (r.error) return void (msg.textContent = `作れませんでした: ${r.error}`);
       void enterPanel(ctx, el, f);
     });
+    box.append(name.box, intro.box, make, msg);
+    return box;
+  };
+  if (!pcs.length) {
     if (!convertible.length) el.append(text('p', 'この場に入るには、あなたの PC（プレイヤーキャラクター）の記事が必要です。'));
-    return void el.append(name.box, intro.box, make, msg);
+    return void el.append(createForm());
   }
   const pc = select('PC:', pcs.map((p) => ({ value: p.id, text: p.title })));
   const npc = select('話す相手:', f.npcs.map((n) => ({ value: n.id, text: `${n.name}（${n.role}）` })));
@@ -212,7 +218,9 @@ async function enterPanel(ctx: HostContext, el: HTMLElement, f: PublicFacility) 
       go.disabled = false;
     }
   });
-  el.append(pc.box, npc.box, go, msg);
+  const more = document.createElement('details');
+  more.append(css(text('summary', '新しい PC を作る'), { cursor: 'pointer', margin: '0.8rem 0 0.4rem' }), createForm());
+  el.append(pc.box, npc.box, go, msg, more);
 }
 
 /** The room: who is present, the shared lines, and talking to the NPC or to everybody. */
