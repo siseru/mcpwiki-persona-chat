@@ -88,14 +88,32 @@ interface Summary {
   id: string;
   type: string;
   title: string;
+  version: number;
 }
 
-/** The user's own PC articles, through the wiki's API (same origin, the user's own token). */
-async function myPCs(ctx: HostContext): Promise<Summary[]> {
+/** The user's own articles, through the wiki's API (same origin, the user's own token). */
+async function myArticles(ctx: HostContext): Promise<Summary[]> {
   const token = await ctx.getAccessToken();
   const r = await fetch('/api/articles?mine=1&limit=200', { headers: { authorization: `Bearer ${token}`, accept: 'application/json' }, signal: ctx.signal });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return ((await r.json()) as { items: Summary[] }).items.filter((a) => a.type === 'PC');
+  return ((await r.json()) as { items: Summary[] }).items;
+}
+
+/** Article types this extension gives a meaning to: never offered for conversion into a PC. */
+const RESERVED_TYPES = ['PC', 'NPC', 'Facility', 'Organization'];
+
+/** Turns one of the user's own articles into a PC (the type only; the wiki checks that the user may edit it). */
+async function makePC(ctx: HostContext, a: Summary): Promise<string | null> {
+  const token = await ctx.getAccessToken();
+  const r = await fetch(`/api/articles/${encodeURIComponent(a.id)}`, {
+    method: 'PUT',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({ version: a.version, type: 'PC' }),
+    signal: ctx.signal,
+  });
+  if (r.ok) return null;
+  const body = (await r.json().catch(() => ({}))) as { error?: { message?: string } };
+  return body.error?.message ?? `HTTP ${r.status}`;
 }
 
 /** Creates a PC article owned by the user (the wiki's editor has no field for the article type). */
@@ -138,11 +156,27 @@ function select(label: string, options: { value: string; text: string }[]) {
 /** Choose (or create) a PC and an NPC, then talk. */
 async function enterPanel(ctx: HostContext, el: HTMLElement, f: PublicFacility) {
   el.replaceChildren();
-  let pcs: Summary[];
+  let mine: Summary[];
   try {
-    pcs = await myPCs(ctx);
+    mine = await myArticles(ctx);
   } catch (e) {
     return void el.append(text('p', `PC の一覧を取得できませんでした: ${e instanceof Error ? e.message : String(e)}`, 'error'));
+  }
+  const pcs = mine.filter((a) => a.type === 'PC');
+  // Articles written in the wiki's editor have its default type: offer to turn one of them into the PC.
+  const convertible = mine.filter((a) => !RESERVED_TYPES.includes(a.type));
+  if (!pcs.length && convertible.length) {
+    const pick = select('自分の記事から PC を選ぶ:', convertible.map((a) => ({ value: a.id, text: a.title })));
+    const use = text('button', 'この記事を PC にする') as HTMLButtonElement;
+    const note = text('p', '記事の種類（type）を PC に変えます。本文などは変わりません。', 'muted');
+    use.addEventListener('click', async () => {
+      use.disabled = true;
+      const err = await makePC(ctx, convertible.find((a) => a.id === pick.get())!);
+      use.disabled = false;
+      if (err) return void (note.textContent = `変えられませんでした: ${err}`);
+      void enterPanel(ctx, el, f);
+    });
+    el.append(text('p', 'この場に入るには、あなたの PC（プレイヤーキャラクター）の記事が必要です。'), pick.box, use, note, text('p', 'または、新しく作ります:', 'muted'));
   }
   if (!pcs.length) {
     const name = input('PC の名前', '');
@@ -157,7 +191,8 @@ async function enterPanel(ctx: HostContext, el: HTMLElement, f: PublicFacility) 
       if (r.error) return void (msg.textContent = `作れませんでした: ${r.error}`);
       void enterPanel(ctx, el, f);
     });
-    return void el.append(text('p', 'この場に入るには、あなたの PC（プレイヤーキャラクター）の記事が必要です。'), name.box, intro.box, make, msg);
+    if (!convertible.length) el.append(text('p', 'この場に入るには、あなたの PC（プレイヤーキャラクター）の記事が必要です。'));
+    return void el.append(name.box, intro.box, make, msg);
   }
   const pc = select('PC:', pcs.map((p) => ({ value: p.id, text: p.title })));
   const npc = select('話す相手:', f.npcs.map((n) => ({ value: n.id, text: `${n.name}（${n.role}）` })));
