@@ -35,7 +35,7 @@ await build({
   target: 'node24',
   format: 'esm',
   // The Lambda runtime provides these clients; @aws-sdk/client-bedrock-agentcore is bundled (src/backend/index.ts).
-  external: ['@aws-sdk/client-dynamodb', '@aws-sdk/client-apigatewaymanagementapi', '@aws-sdk/client-bedrock-runtime'],
+  external: ['@aws-sdk/client-dynamodb', '@aws-sdk/client-apigatewaymanagementapi', '@aws-sdk/client-bedrock-runtime', '@aws-sdk/client-sqs'],
   legalComments: 'none',
   logLevel: 'warning',
   // Bundled CommonJS dependencies (the AgentCore client's @smithy/* packages) call require("node:https"); an ES

@@ -3,6 +3,7 @@
 // given to the model at all yet (revealing them is decided by the server in a later task).
 import { randomBytes } from 'node:crypto';
 import type { FacilitySnapshot, NpcSnapshot } from './catalog.js';
+import type { RoomLine } from './rooms.js';
 
 export interface Turn {
   role: 'user' | 'assistant';
@@ -58,4 +59,35 @@ export function buildChat(facility: FacilitySnapshot, npc: NpcSnapshot, pcName: 
 /** What may be sent to the player: control characters removed, length capped, the fence never echoed. */
 export function cleanReply(text: string, boundary: string): string {
   return clean(text.split(boundary).join('')).slice(0, MAX_REPLY_CHARS);
+}
+
+/**
+ * A shared room (Task 10): the answering NPC's own lines are "assistant"; everything else (PCs, other NPCs, people
+ * coming and going) is context in fenced "user" messages, "Name: text" per line. Consecutive user lines are merged
+ * (the conversation must alternate and start with the user).
+ */
+export function buildRoomChat(
+  facility: FacilitySnapshot,
+  npc: NpcSnapshot,
+  speaker: { pcName: string; memories: string[] },
+  lines: RoomLine[],
+  present: string[],
+): { system: string; messages: Turn[]; boundary: string } {
+  const base = buildChat(facility, npc, speaker.pcName, [], speaker.memories);
+  const b = base.boundary;
+  const others = present.filter((n) => n !== speaker.pcName);
+  const system = [
+    base.system,
+    others.length ? `Also present: ${others.join(', ')}. Several people may talk; answer ${speaker.pcName}'s last line.` : '',
+  ].filter(Boolean).join('\n');
+  const messages: Turn[] = [];
+  for (const l of lines.slice(-HISTORY_TURNS * 2)) {
+    const role = l.kind === 'npc' && l.npcId === npc.id ? 'assistant' : 'user';
+    const text = role === 'assistant' ? l.text : l.kind === 'system' ? `（${l.text}）` : `${l.speaker}: ${l.text}`;
+    const last = messages.at(-1);
+    if (last && last.role === role) last.text += `\n${text}`;
+    else messages.push({ role, text });
+  }
+  while (messages[0]?.role === 'assistant') messages.shift();
+  return { system, messages: messages.map((m) => (m.role === 'user' ? { role: 'user', text: `<<${b}\n${m.text.split(b).join('')}\n${b}>>` } : m)), boundary: b };
 }

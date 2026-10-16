@@ -2,15 +2,18 @@
 // Lambda runtime). Configuration: WIKI_ORIGIN, ISSUER, CLIENT_ID, TABLE (tickets, connections, budgets), CATALOG
 // (publications), MODEL_ID (Bedrock inference profile for drafts).
 import { ApiGatewayManagementApiClient, DeleteConnectionCommand, GoneException, PostToConnectionCommand } from '@aws-sdk/client-apigatewaymanagementapi';
+import { randomUUID } from 'node:crypto';
 // Bundled (not the runtime's copy): custom namespace variables (extractionConfig) need client 3.1148+.
 import { BedrockAgentCoreClient, CreateEventCommand, ListMemoryRecordsCommand } from '@aws-sdk/client-bedrock-agentcore';
 import { BedrockRuntimeClient, ConverseCommand, ConverseStreamCommand } from '@aws-sdk/client-bedrock-runtime';
 import { ConditionalCheckFailedException, DeleteItemCommand, DynamoDBClient, GetItemCommand, PutItemCommand, ScanCommand, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
+import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import type { Publication } from './catalog.js';
-import type { ChatProvider, Turn } from './chat.js';
+import type { ChatProvider } from './chat.js';
 import { namespaceOf, type MemoryProvider } from './memory.js';
+import type { JoinResult, Member, RoomLine, RoomStore } from './rooms.js';
 import { DraftError, type LlmProvider } from './draft.js';
-import { handleAdopt, handleAuthorize, handleConnect, handleDisconnect, handleDraft, handleList, handleMessage, handlePublish, handleTicket, handleUnpublish, type Budget, type CatalogStore, type ConversationStore, type Connection, type ConnectionStore, type Deps, type HttpRequest, type HttpResult } from './handlers.js';
+import { handleAdopt, handleAuthorize, handleConnect, handleDisconnect, handleDraft, handleList, handleMessage, handlePublish, handleRoomJob, handleTicket, handleUnpublish, type Budget, type CatalogStore, type HistoryStore, type Job, type Connection, type ConnectionStore, type Deps, type HttpRequest, type HttpResult } from './handlers.js';
 import { TokenVerifier } from './jwt.js';
 import type { Identity, TicketStore } from './tickets.js';
 
@@ -107,22 +110,113 @@ const budget: Budget = {
   },
 };
 
-const conversations: ConversationStore = {
-  async get(id) {
-    const r = await db.send(new GetItemCommand({ TableName: TABLE, Key: { pk: { S: `conv#${id}` } }, ConsistentRead: true }));
-    return {
-      turns: r.Item?.turns?.S ? (JSON.parse(r.Item.turns.S) as Turn[]) : [],
-      memories: r.Item?.memories?.S ? (JSON.parse(r.Item.memories.S) as string[]) : [],
-    };
+const history: HistoryStore = {
+  async get(facilityId) {
+    const r = await db.send(new GetItemCommand({ TableName: TABLE, Key: { pk: { S: `history#${facilityId}` } }, ConsistentRead: true }));
+    return r.Item?.lines?.S ? (JSON.parse(r.Item.lines.S) as RoomLine[]) : [];
   },
-  async put(id, conv, expiresAt) {
+  async put(facilityId, lines, expiresAt) {
+    await db.send(new PutItemCommand({ TableName: TABLE, Item: { pk: { S: `history#${facilityId}` }, lines: { S: JSON.stringify(lines) }, ttl: { N: String(expiresAt) } } }));
+  },
+};
+
+/**
+ * One item per room: pk room#<facility>, a map of members (connection id -> JSON) and their count. Joining is a
+ * conditional update (count below capacity, not yet a member), so two people can never take the last place.
+ */
+const rooms: RoomStore = {
+  async join(facilityId, m, capacity, staleBefore) {
+    const pk = { S: `room#${facilityId}` };
+    // The members map must exist before a member can be set inside it.
+    await db.send(new PutItemCommand({ TableName: TABLE, Item: { pk, members: { M: {} }, n: { N: '0' } }, ConditionExpression: 'attribute_not_exists(pk)' })).catch((e) => {
+      if (!(e instanceof ConditionalCheckFailedException)) throw e;
+    });
+    const tryJoin = async (): Promise<boolean> => {
+      try {
+        await db.send(
+          new UpdateItemCommand({
+            TableName: TABLE,
+            Key: { pk },
+            UpdateExpression: 'SET members.#c = :m ADD n :one',
+            ConditionExpression: 'n < :cap AND attribute_not_exists(members.#c)',
+            ExpressionAttributeNames: { '#c': m.connectionId },
+            ExpressionAttributeValues: { ':m': { S: JSON.stringify(m) }, ':one': { N: '1' }, ':cap': { N: String(capacity) } },
+          }),
+        );
+        return true;
+      } catch (e) {
+        if (e instanceof ConditionalCheckFailedException) return false;
+        throw e;
+      }
+    };
+    if (await tryJoin()) return 'joined' satisfies JoinResult;
+    const current = await this.members(facilityId);
+    if (current.some((x) => x.connectionId === m.connectionId)) return 'already';
+    // Full: drop members without a heartbeat (lost $disconnect), each only if unchanged since read, then retry once.
+    for (const x of current.filter((x) => x.lastSeen < staleBefore)) await removeMember(facilityId, x.connectionId, JSON.stringify(x));
+    return (await tryJoin()) ? 'joined' : 'full';
+  },
+  async leave(facilityId, connectionId) {
+    const r = await db.send(new GetItemCommand({ TableName: TABLE, Key: { pk: { S: `room#${facilityId}` } }, ConsistentRead: true }));
+    const raw = r.Item?.members?.M?.[connectionId]?.S;
+    if (!raw) return null;
+    return (await removeMember(facilityId, connectionId)) ? (JSON.parse(raw) as Member) : null;
+  },
+  async members(facilityId) {
+    const r = await db.send(new GetItemCommand({ TableName: TABLE, Key: { pk: { S: `room#${facilityId}` } }, ConsistentRead: true }));
+    return Object.values(r.Item?.members?.M ?? {}).map((v) => JSON.parse(v.S!) as Member);
+  },
+  async touch(facilityId, connectionId, now) {
+    const r = await db.send(new GetItemCommand({ TableName: TABLE, Key: { pk: { S: `room#${facilityId}` } }, ConsistentRead: true }));
+    const raw = r.Item?.members?.M?.[connectionId]?.S;
+    if (!raw) return;
+    await db
+      .send(
+        new UpdateItemCommand({
+          TableName: TABLE,
+          Key: { pk: { S: `room#${facilityId}` } },
+          UpdateExpression: 'SET members.#c = :m',
+          ConditionExpression: 'attribute_exists(members.#c)',
+          ExpressionAttributeNames: { '#c': connectionId },
+          ExpressionAttributeValues: { ':m': { S: JSON.stringify({ ...(JSON.parse(raw) as Member), lastSeen: now }) } },
+        }),
+      )
+      .catch((e) => {
+        if (!(e instanceof ConditionalCheckFailedException)) throw e; // left meanwhile
+      });
+  },
+};
+
+/** Removes one member (optionally only if its stored JSON is still `expected`); true if it was removed. */
+async function removeMember(facilityId: string, connectionId: string, expected?: string): Promise<boolean> {
+  try {
     await db.send(
-      new PutItemCommand({
+      new UpdateItemCommand({
         TableName: TABLE,
-        Item: { pk: { S: `conv#${id}` }, turns: { S: JSON.stringify(conv.turns.slice(-40)) }, memories: { S: JSON.stringify(conv.memories) }, ttl: { N: String(expiresAt) } },
+        Key: { pk: { S: `room#${facilityId}` } },
+        UpdateExpression: 'REMOVE members.#c ADD n :minus',
+        ConditionExpression: expected ? 'members.#c = :expected' : 'attribute_exists(members.#c)',
+        ExpressionAttributeNames: { '#c': connectionId },
+        ExpressionAttributeValues: { ':minus': { N: '-1' }, ...(expected ? { ':expected': { S: expected } } : {}) },
       }),
     );
-  },
+    return true;
+  } catch (e) {
+    if (e instanceof ConditionalCheckFailedException) return false;
+    throw e;
+  }
+}
+
+const sqs = new SQSClient({});
+const enqueue = async (job: Job) => {
+  await sqs.send(
+    new SendMessageCommand({
+      QueueUrl: env('QUEUE_URL'),
+      MessageBody: JSON.stringify(job),
+      MessageGroupId: job.facilityId, // one room at a time, in order
+      MessageDeduplicationId: randomUUID(),
+    }),
+  );
 };
 
 const agentcore = new BedrockAgentCoreClient({});
@@ -215,15 +309,11 @@ async function wikiSend(token: string, method: 'GET' | 'POST', path: string, bod
 }
 const wikiGet = (token: string, path: string) => wikiSend(token, 'GET', path);
 
-const managers = new Map<string, ApiGatewayManagementApiClient>();
-const manager = (ctx: { domainName: string; stage: string }) => {
-  const endpoint = `https://${ctx.domainName}/${ctx.stage}`;
-  let m = managers.get(endpoint);
-  if (!m) managers.set(endpoint, (m = new ApiGatewayManagementApiClient({ endpoint })));
-  return m;
-};
+// The room worker is not invoked by API Gateway, so the management endpoint comes from the configuration.
+let managerClient: ApiGatewayManagementApiClient | undefined;
+const manager = () => (managerClient ??= new ApiGatewayManagementApiClient({ endpoint: env('SOCKET_ENDPOINT') }));
 
-const deps = (ws?: { domainName: string; stage: string }): Deps => ({
+const deps = (): Deps => ({
   wikiOrigin: WIKI_ORIGIN,
   verifier,
   tickets,
@@ -234,20 +324,24 @@ const deps = (ws?: { domainName: string; stage: string }): Deps => ({
   createArticle: (token, input) => wikiSend(token, 'POST', '/api/articles', input),
   llm,
   chat,
-  conversations,
+  history,
+  rooms,
+  enqueue,
   memory,
   budget,
   send: async (connectionId, data) => {
     try {
-      await manager(ws!).send(new PostToConnectionCommand({ ConnectionId: connectionId, Data: Buffer.from(JSON.stringify(data)) }));
+      await manager().send(new PostToConnectionCommand({ ConnectionId: connectionId, Data: Buffer.from(JSON.stringify(data)) }));
+      return true;
     } catch (e) {
       if (!(e instanceof GoneException)) throw e;
       await connections.delete(connectionId);
+      return false;
     }
   },
   close: async (connectionId) => {
     try {
-      await manager(ws!).send(new DeleteConnectionCommand({ ConnectionId: connectionId }));
+      await manager().send(new DeleteConnectionCommand({ ConnectionId: connectionId }));
     } catch (e) {
       if (!(e instanceof GoneException)) throw e;
     }
@@ -296,7 +390,7 @@ interface WsEvent {
 /** WebSocket routes: $connect, $disconnect and $default. */
 export async function ws(event: WsEvent) {
   const ctx = event.requestContext;
-  const d = deps(ctx);
+  const d = deps();
   if (ctx.routeKey === '$connect') {
     const a = ctx.authorizer ?? {};
     await handleConnect(d, ctx.connectionId, { sub: a.sub!, username: a.username!, role: a.role as Identity['role'], ...(a.session ? { session: JSON.parse(a.session) } : {}) });
@@ -306,4 +400,10 @@ export async function ws(event: WsEvent) {
     await handleMessage(d, ctx.connectionId, event.body);
   }
   return { statusCode: 200 };
+}
+
+/** The room worker (SQS FIFO, batch size 1): one job at a time per room. */
+export async function worker(event: { Records: { body: string }[] }) {
+  const d = deps();
+  for (const r of event.Records) await handleRoomJob(d, JSON.parse(r.body) as Job);
 }

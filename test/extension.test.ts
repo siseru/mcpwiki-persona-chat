@@ -86,7 +86,8 @@ test('the ticket API answers the wiki page only, the socket needs a ticket, and 
     .sort();
   assert.deepEqual(actions, [
     'dynamodb:DeleteItem', // authorizer: consumes tickets
-    'dynamodb:DeleteItem,dynamodb:GetItem,dynamodb:GetItem,dynamodb:PutItem,dynamodb:UpdateItem', // routes: connections, conversations, budgets; reads snapshots
+    'dynamodb:DeleteItem,dynamodb:GetItem,dynamodb:GetItem,dynamodb:PutItem,dynamodb:UpdateItem', // routes: connections, rooms, budgets; reads snapshots
+    'dynamodb:DeleteItem,dynamodb:GetItem,dynamodb:GetItem,dynamodb:PutItem,dynamodb:UpdateItem', // room worker: rooms, histories; reads snapshots
     'dynamodb:DeleteItem,dynamodb:GetItem,dynamodb:PutItem,dynamodb:PutItem,dynamodb:Scan,dynamodb:UpdateItem', // HTTP: tickets, budgets, catalog
   ]);
   // Bedrock: one model, through its US inference profile; nothing else can invoke models.
@@ -94,7 +95,7 @@ test('the ticket API answers the wiki page only, the socket needs a ticket, and 
   assert.deepEqual(invoke.map((s) => s.Action).sort(), ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream']);
   // Memory: the route function adds events and lists records of this one memory; nothing deletes or edits them.
   const mem = statements.filter((s) => JSON.stringify(s.Action).includes('bedrock-agentcore:'));
-  assert.deepEqual(mem.map((s) => [s.Action].flat().sort()), [['bedrock-agentcore:CreateEvent', 'bedrock-agentcore:ListMemoryRecords']]);
+  assert.deepEqual(mem.map((s) => [s.Action].flat().sort()).sort(), [['bedrock-agentcore:CreateEvent'], ['bedrock-agentcore:ListMemoryRecords']]);
   const [[, memRes]] = of('AWS::BedrockAgentCore::Memory') as [string, any][];
   assert.equal(memRes.Properties.Name, 'PersonaChat_dev');
   assert.deepEqual(memRes.Properties.MemoryStrategies[0].SemanticMemoryStrategy.NamespaceTemplates, ['/npc/{npc}/pc/{pc}/']);

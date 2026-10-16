@@ -215,30 +215,45 @@ async function enterPanel(ctx: HostContext, el: HTMLElement, f: PublicFacility) 
   el.append(pc.box, npc.box, go, msg);
 }
 
+/** The room: who is present, the shared lines, and talking to the NPC or to everybody. */
 function chat(ctx: HostContext, el: HTMLElement, socket: WebSocket, pcName: string) {
   el.replaceChildren();
-  ctx.signal.addEventListener('abort', () => socket.close());
-  const log = css(document.createElement('div'), { border: '1px solid currentColor', borderRadius: '6px', padding: '0.6rem', minHeight: '8rem', maxHeight: '24rem', overflowY: 'auto', margin: '0 0 0.6rem' });
   const status = text('p', '接続しています…', 'muted');
+  const present = text('p', '', 'muted');
+  const log = css(document.createElement('div'), { border: '1px solid currentColor', borderRadius: '6px', padding: '0.6rem', minHeight: '8rem', maxHeight: '24rem', overflowY: 'auto', margin: '0 0 0.6rem' });
   const say = input(`${pcName} として話す（Enter で送信、Shift+Enter で改行）`, '', { multiline: true, rows: 2 });
   const area = say.box.querySelector('textarea')!;
+  const toNpc = document.createElement('input');
+  toNpc.type = 'radio';
+  toNpc.name = 'pc-to';
+  toNpc.checked = true;
+  const toAll = document.createElement('input');
+  toAll.type = 'radio';
+  toAll.name = 'pc-to';
+  const target = document.createElement('div');
+  const npcLabel = document.createElement('label');
+  const allLabel = document.createElement('label');
+  npcLabel.append(toNpc, ' NPC に話す');
+  allLabel.append(toAll, ' みんなに話す（NPC は名前を呼ばれたときだけ答えます）');
+  target.append(npcLabel, '　', allLabel);
   const send = text('button', '話す') as HTMLButtonElement;
   const leave = text('button', '出る') as HTMLButtonElement;
   leave.className = 'secondary';
-  let npcName = 'NPC';
   let current: HTMLElement | null = null;
-  const line = (who: string, words: string) => {
+  const line = (kind: string, who: string, words: string) => {
     const p = css(document.createElement('p'), { margin: '0 0 0.5rem' });
-    p.append(text('strong', `${who}: `), text('span', words));
+    if (kind === 'system') p.append(text('em', words, 'muted'));
+    else p.append(text('strong', `${who}: `), text('span', words));
     log.append(p);
     log.scrollTop = log.scrollHeight;
     return p.lastElementChild as HTMLElement;
   };
+  const showPresent = (names: string[] | undefined) => names && (present.textContent = `この場にいる PC: ${names.join('、')}`);
   const submit = () => {
     const words = say.get();
     if (!words || socket.readyState !== WebSocket.OPEN) return;
-    line(pcName, words);
-    socket.send(JSON.stringify({ type: 'say', text: words }));
+    // The line comes back from the room (in order with everybody else's), so it is not shown here.
+    socket.send(JSON.stringify({ type: 'say', text: words, to: toAll.checked ? 'all' : 'npc' }));
     area.value = '';
   };
   send.addEventListener('click', submit);
@@ -249,34 +264,44 @@ function chat(ctx: HostContext, el: HTMLElement, socket: WebSocket, pcName: stri
     }
   });
   leave.addEventListener('click', () => socket.close());
+  // Heartbeat: a PC without one for 3 minutes counts as gone (its place in the room is freed).
+  const heartbeat = setInterval(() => socket.readyState === WebSocket.OPEN && socket.send(JSON.stringify({ type: 'ping', t: Date.now() })), 60_000);
+  const stop = () => (clearInterval(heartbeat), socket.close());
+  ctx.signal.addEventListener('abort', stop);
   socket.addEventListener('open', () => socket.send(JSON.stringify({ type: 'hello' })));
   socket.addEventListener('message', (ev) => {
-    const m = JSON.parse(String(ev.data)) as { type: string; text?: string; code?: string; npc?: { name: string }; facility?: string };
-    if (m.type === 'npc') {
-      npcName = m.npc!.name;
-      status.textContent = `${m.facility} で ${npcName} と話しています。`;
-      line(npcName, m.text ?? '');
+    const m = JSON.parse(String(ev.data)) as {
+      type: string; kind?: string; speaker?: string; text?: string; code?: string; capacity?: number; facility?: string;
+      present?: string[]; history?: { kind: string; speaker: string; text: string }[];
+    };
+    if (m.type === 'room') {
+      status.textContent = `${m.facility}（定員 ${m.capacity} 人）にいます。`;
+      showPresent(m.present);
+      for (const l of m.history ?? []) line(l.kind, l.speaker, l.text);
+    } else if (m.type === 'line') {
+      line(m.kind ?? 'pc', m.speaker ?? '', m.text ?? '');
+      showPresent(m.present);
     } else if (m.type === 'start') {
-      current = line(npcName, '…');
-      current.textContent = '';
+      current = line('npc', m.speaker ?? 'NPC', '');
     } else if (m.type === 'delta' && current) {
       current.textContent += m.text ?? '';
       log.scrollTop = log.scrollHeight;
-    } else if (m.type === 'done' && current) {
-      current.textContent = m.text ?? current.textContent;
+    } else if (m.type === 'done') {
+      if (current) current.textContent = m.text ?? current.textContent;
       current = null;
     } else if (m.type === 'reauth') {
       status.textContent = '長い時間がたったので、いったん切断します。もう一度「入る」を押してください。';
     } else if (m.type === 'error') {
       if (current) (current.textContent ||= '……'), (current = null);
-      status.textContent = CHAT_ERRORS[m.code ?? ''] ?? `エラー: ${m.code}`;
+      status.textContent = m.code === 'room_full' ? `満室です（定員 ${m.capacity} 人）。あとでもう一度どうぞ。` : (CHAT_ERRORS[m.code ?? ''] ?? `エラー: ${m.code}`);
     }
   });
   socket.addEventListener('close', () => {
+    clearInterval(heartbeat);
     send.disabled = true;
     status.textContent = `${status.textContent ?? ''}（退出しました）`;
   });
-  el.append(status, log, say.box, send, ' ', leave);
+  el.append(status, present, log, target, say.box, send, ' ', leave);
 }
 
 /** Below a facility article: whether it is published; for DMs (admins), publish / update / unpublish. */
