@@ -4,6 +4,7 @@ import {
   aws_apigatewayv2 as apigw,
   aws_apigatewayv2_authorizers as authorizers,
   aws_apigatewayv2_integrations as integrations,
+  aws_bedrockagentcore as agentcore,
   aws_dynamodb as ddb,
   aws_iam as iam,
   aws_lambda as lambda,
@@ -94,9 +95,25 @@ export class ExtensionStack extends Stack {
       deletionProtection: prod,
     });
 
+    // What NPCs remember about PCs (docs/spike.md): long-term records per NPC x PC under /npc/<npc>/pc/<pc>/, extracted
+    // by AgentCore's built-in semantic strategy (no execution role needed). Raw events expire after 30 days.
+    const articleIdRe = '^[a-z0-9][a-z0-9-]{0,62}$';
+    const memory = new agentcore.CfnMemory(this, 'Memory', {
+      name: `PersonaChat_${props.envName}`, // no dashes allowed; the guard's name backstop expects PersonaChat_prod*
+      description: `persona-chat ${props.envName}: what NPCs remember about PCs`,
+      eventExpiryDuration: 30,
+      namespaceKeys: [
+        { key: 'npc', validation: { regexPattern: articleIdRe } },
+        { key: 'pc', validation: { regexPattern: articleIdRe } },
+      ],
+      memoryStrategies: [{ semanticMemoryStrategy: { name: 'facts', namespaceTemplates: ['/npc/{npc}/pc/{pc}/'] } }],
+      tags: { Project: 'persona-chat', Environment: props.envName, Component: 'memory' },
+    });
+    memory.applyRemovalPolicy(prod ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY);
+
     // ---------------------------------------------------------------- functions
     const code = lambda.Code.fromAsset(join(props.repoRoot, 'dist/backend'));
-    const environment = { WIKI_ORIGIN: wiki.origin, ISSUER: wiki.issuer, CLIENT_ID: wiki.clientId, TABLE: table.tableName, CATALOG: catalog.tableName, MODEL_ID: props.draftModel };
+    const environment = { WIKI_ORIGIN: wiki.origin, ISSUER: wiki.issuer, CLIENT_ID: wiki.clientId, TABLE: table.tableName, CATALOG: catalog.tableName, MODEL_ID: props.draftModel, MEMORY_ID: memory.attrMemoryId };
     const fn = (name: string, handler: string, description: string, timeout = Duration.seconds(10)) => {
       const logGroup = new logs.LogGroup(this, `${name}Logs`, { retention: logs.RetentionDays.ONE_MONTH, removalPolicy: RemovalPolicy.DESTROY });
       return new lambda.Function(this, name, {
@@ -136,6 +153,8 @@ export class ExtensionStack extends Stack {
     // Connections, conversation logs and chat budgets; published snapshots are read only.
     wsFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:DeleteItem', 'dynamodb:UpdateItem'], resources: [table.tableArn] }));
     wsFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:GetItem'], resources: [catalog.tableArn] }));
+    // Memory: add events, list one NPC x PC namespace. No deletion or editing here (that is the DM's, Task 11).
+    wsFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['bedrock-agentcore:CreateEvent', 'bedrock-agentcore:ListMemoryRecords'], resources: [memory.attrMemoryArn] }));
 
     // ---------------------------------------------------------------- APIs
     const http = new apigw.HttpApi(this, 'TicketApi', {

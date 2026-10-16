@@ -92,6 +92,13 @@ test('the ticket API answers the wiki page only, the socket needs a ticket, and 
   // Bedrock: one model, through its US inference profile; nothing else can invoke models.
   const invoke = statements.filter((s) => JSON.stringify(s.Action).includes('bedrock:'));
   assert.deepEqual(invoke.map((s) => s.Action).sort(), ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream']);
+  // Memory: the route function adds events and lists records of this one memory; nothing deletes or edits them.
+  const mem = statements.filter((s) => JSON.stringify(s.Action).includes('bedrock-agentcore:'));
+  assert.deepEqual(mem.map((s) => [s.Action].flat().sort()), [['bedrock-agentcore:CreateEvent', 'bedrock-agentcore:ListMemoryRecords']]);
+  const [[, memRes]] = of('AWS::BedrockAgentCore::Memory') as [string, any][];
+  assert.equal(memRes.Properties.Name, 'PersonaChat_dev');
+  assert.deepEqual(memRes.Properties.MemoryStrategies[0].SemanticMemoryStrategy.NamespaceTemplates, ['/npc/{npc}/pc/{pc}/']);
+  assert.deepEqual(memRes.Properties.NamespaceKeys.map((k: any) => k.Key), ['npc', 'pc']);
   for (const s of invoke) assert.ok(s.Resource.every((r: string) => r.endsWith('/us.anthropic.claude-haiku-5-5') || r.endsWith('foundation-model/anthropic.claude-haiku-5-5')), JSON.stringify(s.Resource));
   // The catalog is touched by the HTTP function only, and nothing may scan the ticket / connection table.
   const catalogLogical = of('AWS::DynamoDB::GlobalTable').find(([k]) => k.startsWith('Catalog'))![0];
