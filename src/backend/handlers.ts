@@ -1,14 +1,17 @@
 // Request handling, independent of AWS (the Lambda entry points in index.ts wire in DynamoDB, the API Gateway
 // management API and fetch). Never logs tokens, tickets or message text.
 import { ARTICLE_ID_RE, parseFacility, parseNpc, publicView, SchemaError, sourceVersions, type Publication, type WikiArticle } from './catalog.js';
-import { buildChat, clean, cleanReply, MAX_REPLY_CHARS, MAX_SAY_CHARS, type ChatProvider, type Turn } from './chat.js';
+import { buildRoomChat, clean, cleanReply, MAX_REPLY_CHARS, MAX_SAY_CHARS, REPLY_MAX_TOKENS, type ChatProvider } from './chat.js';
 import { buildPrompt, DRAFT_TOOL, DraftError, parseDraft, type LlmProvider } from './draft.js';
 import { RECALL_MAX, sessionIdOf, type MemoryProvider } from './memory.js';
 import { AuthError, type TokenVerifier } from './jwt.js';
-import { issueTicket, MAX_CONNECTION_SEC, redeemTicket, type Identity, type Session, type TicketStore } from './tickets.js';
+import { decideResponder, STALE_SEC, type Member, type RoomJob, type RoomLine, type RoomStore } from './rooms.js';
+import { issueTicket, MAX_CONNECTION_SEC, redeemTicket, type Identity, type TicketStore } from './tickets.js';
 
 export interface Connection extends Identity {
   connectedAt: number;
+  /** What each NPC of the room remembered about this PC when it joined (recalled once, at hello). */
+  memories?: Record<string, string[]>;
 }
 
 export interface ConnectionStore {
@@ -24,16 +27,14 @@ export interface CatalogStore {
   list(): Promise<Publication[]>;
 }
 
-export interface Conversation {
-  turns: Turn[];
-  /** What the NPC remembered about the PC when the conversation started (recalled once, at hello). */
-  memories: string[];
+/** A room's shared history (written by the room worker only, so lines never race). */
+export interface HistoryStore {
+  get(facilityId: string): Promise<RoomLine[]>;
+  put(facilityId: string, lines: RoomLine[], expiresAt: number): Promise<void>;
 }
 
-export interface ConversationStore {
-  get(connectionId: string): Promise<Conversation>;
-  put(connectionId: string, conversation: Conversation, expiresAt: number): Promise<void>;
-}
+/** Work for the room worker, serialized per room (SQS FIFO, MessageGroupId = facility). */
+export type Job = ({ type: 'say' } & RoomJob) | { type: 'system'; facilityId: string; text: string };
 
 export interface Budget {
   /** Counts one use of `key`; false (and nothing counted) when `limit` uses were already made. */
@@ -55,10 +56,13 @@ export interface Deps {
   createArticle: (token: string, input: Record<string, unknown>) => Promise<{ status: number; body: unknown }>;
   llm: LlmProvider;
   chat: ChatProvider;
-  conversations: ConversationStore;
+  history: HistoryStore;
+  rooms: RoomStore;
+  enqueue: (job: Job) => Promise<void>;
   memory: MemoryProvider;
   budget: Budget;
-  send: (connectionId: string, data: unknown) => Promise<void>;
+  /** Resolves false when the connection is gone. */
+  send: (connectionId: string, data: unknown) => Promise<boolean | void>;
   close: (connectionId: string) => Promise<void>;
   now: () => number; // epoch seconds
   log: (entry: Record<string, unknown>) => void;
@@ -318,44 +322,81 @@ export async function handleConnect(d: Deps, connectionId: string, identity: Ide
 }
 
 export async function handleDisconnect(d: Deps, connectionId: string): Promise<void> {
+  const c = await d.connections.get(connectionId);
   await d.connections.delete(connectionId);
+  if (c?.session) {
+    const m = await d.rooms.leave(c.session.facilityId, connectionId);
+    if (m) await d.enqueue({ type: 'system', facilityId: c.session.facilityId, text: `${m.pcName} が出ていきました` });
+  }
   d.log({ msg: 'disconnected', connectionId });
 }
 
-/** Conversation logs live a week (TTL), long enough for the DM to look at them, then they are gone. */
+/** Room histories live a week (TTL), long enough for the DM to look at them, then they are gone. */
 export const CONVERSATION_TTL_SEC = 7 * 86400;
-/** Lines per user and UTC day, and per connection per 3 seconds (each is a Bedrock call). */
+/** Lines per user and UTC day, and per connection per 3 seconds (each may become a Bedrock call). */
 export const SAYS_PER_DAY = 300;
+/** Lines of the shared history sent to a newcomer, and kept (one DynamoDB item: at most 400 KB). */
+const HISTORY_ON_JOIN = 20;
+const HISTORY_KEPT = 100;
 
-async function npcFor(d: Deps, s: Session) {
-  const pub = await d.catalog.get(s.facilityId);
-  const npc = pub?.publication.npcs.find((n) => n.id === s.npcId);
-  return pub && npc ? { facility: pub.publication.facility, npc } : null;
+async function publication(d: Deps, facilityId: string) {
+  return (await d.catalog.get(facilityId))?.publication ?? null;
 }
 
-/** { "type": "hello" } after connecting: the NPC's greeting (from the snapshot, not the model). */
+/** Sends to everybody in the room; members whose connection is gone are removed. */
+async function broadcast(d: Deps, facilityId: string, data: unknown, members?: Member[]) {
+  for (const m of members ?? (await d.rooms.members(facilityId))) {
+    if ((await d.send(m.connectionId, data)) === false) await d.rooms.leave(facilityId, m.connectionId);
+  }
+}
+
+/**
+ * { "type": "hello" } after connecting: joins the facility's room (capacity from the published snapshot), recalls
+ * what each NPC remembers about this PC, and sends the room (NPCs, who is present, recent lines) and the greeting
+ * of the PC's NPC (from the snapshot, not the model).
+ */
 async function hello(d: Deps, connectionId: string, c: Connection) {
   if (!c.session) return d.send(connectionId, { type: 'error', code: 'no_session' });
-  const found = await npcFor(d, c.session);
-  if (!found) return d.send(connectionId, { type: 'error', code: 'not_published' });
-  const greeting = found.npc.greeting || '……';
-  const conv = await d.conversations.get(connectionId);
-  if (!conv.turns.length) {
-    // A memory outage must not keep the PC out: the NPC just remembers nothing this time.
-    let memories: string[] = [];
+  const s = c.session;
+  const pub = await publication(d, s.facilityId);
+  const npc = pub?.npcs.find((n) => n.id === s.npcId);
+  if (!pub || !npc) return d.send(connectionId, { type: 'error', code: 'not_published' });
+  // A memory outage must not keep the PC out: the NPC just remembers nothing this time.
+  const memories: Record<string, string[]> = {};
+  for (const n of pub.npcs) {
     try {
-      memories = await d.memory.recall({ npcId: c.session.npcId, pcId: c.session.pcId }, RECALL_MAX);
+      memories[n.id] = await d.memory.recall({ npcId: n.id, pcId: s.pcId }, RECALL_MAX);
     } catch (e) {
+      memories[n.id] = [];
       d.log({ msg: 'memory error', op: 'recall', error: e instanceof Error ? e.name : 'unknown' });
     }
-    await d.conversations.put(connectionId, { turns: [{ role: 'assistant', text: greeting }], memories }, d.now() + CONVERSATION_TTL_SEC);
-    d.log({ msg: 'recalled', sub: c.sub, npc: c.session.npcId, pc: c.session.pcId, count: memories.length });
   }
-  return d.send(connectionId, { type: 'npc', npc: { id: found.npc.id, name: found.npc.name, role: found.npc.role }, facility: found.facility.title, text: greeting });
+  const now = d.now();
+  // Memories stay with the connection (a full room's memories would not fit into one room item).
+  await d.connections.put(connectionId, { ...c, memories }, c.connectedAt + 2 * 3600 + 300);
+  const member: Member = { connectionId, sub: c.sub, pcId: s.pcId, pcName: s.pcName, npcId: s.npcId, joinedAt: now, lastSeen: now };
+  const joined = await d.rooms.join(s.facilityId, member, pub.facility.capacity, now - STALE_SEC);
+  if (joined === 'full') {
+    await d.send(connectionId, { type: 'error', code: 'room_full', capacity: pub.facility.capacity });
+    return d.close(connectionId);
+  }
+  d.log({ msg: 'joined', sub: c.sub, facility: s.facilityId, pc: s.pcId, recalled: Object.values(memories).reduce((n, m) => n + m.length, 0) });
+  if (joined === 'joined') await d.enqueue({ type: 'system', facilityId: s.facilityId, text: `${s.pcName} が入ってきました` });
+  const members = await d.rooms.members(s.facilityId);
+  await d.send(connectionId, {
+    type: 'room',
+    facility: pub.facility.title,
+    capacity: pub.facility.capacity,
+    npcs: pub.npcs.map((n) => ({ id: n.id, name: n.name, role: n.role })),
+    present: members.map((m) => m.pcName),
+    you: { pcName: s.pcName, npcId: s.npcId },
+    history: (await d.history.get(s.facilityId)).slice(-HISTORY_ON_JOIN),
+  });
+  return d.send(connectionId, { type: 'line', kind: 'npc', speaker: npc.name, npcId: npc.id, text: npc.greeting || '……', private: true });
 }
 
-/** { "type": "say", "text": "..." }: one line from the PC; the NPC's reply is streamed as "delta" messages. */
-async function say(d: Deps, connectionId: string, c: Connection, raw: unknown) {
+/** { "type": "say", "text", "to": "npc" | "all" }: checked here, then queued for the room worker. */
+async function say(d: Deps, connectionId: string, c: Connection, raw: unknown, to: unknown) {
   if (!c.session) return d.send(connectionId, { type: 'error', code: 'no_session' });
   const text = typeof raw === 'string' ? clean(raw) : '';
   if (!text || text.length > MAX_SAY_CHARS) return d.send(connectionId, { type: 'error', code: 'bad_text', max: MAX_SAY_CHARS });
@@ -363,46 +404,71 @@ async function say(d: Deps, connectionId: string, c: Connection, raw: unknown) {
   if (!(await d.budget.take(`rate#conn#${connectionId}#${Math.floor(now / 3)}`, 1, 60))) return d.send(connectionId, { type: 'error', code: 'too_fast' });
   const day = new Date(now * 1000).toISOString().slice(0, 10);
   if (!(await d.budget.take(`budget#chat#${c.sub}#${day}`, SAYS_PER_DAY, 2 * 86400))) return d.send(connectionId, { type: 'error', code: 'budget_exceeded' });
-  const found = await npcFor(d, c.session);
-  if (!found) return d.send(connectionId, { type: 'error', code: 'not_published' });
-  const conv = await d.conversations.get(connectionId);
-  const history = [...conv.turns, { role: 'user' as const, text }];
-  const { system, messages, boundary } = buildChat(found.facility, found.npc, c.session.pcName, history, conv.memories);
-  await d.send(connectionId, { type: 'start' });
+  return d.enqueue({ type: 'say', facilityId: c.session.facilityId, connectionId, text, to: to === 'all' ? 'all' : 'npc' });
+}
+
+/**
+ * The room worker: one job at a time per room. Adds the line to the shared history and shows it to everybody;
+ * for a PC's line, the responder (if any, decided by decideResponder) answers, streamed to everybody.
+ */
+export async function handleRoomJob(d: Deps, job: Job): Promise<void> {
+  const pub = await publication(d, job.facilityId);
+  const members = await d.rooms.members(job.facilityId);
+  const lines = await d.history.get(job.facilityId);
+  const now = d.now();
+  const save = (...add: RoomLine[]) => d.history.put(job.facilityId, [...lines, ...add].slice(-HISTORY_KEPT), now + CONVERSATION_TTL_SEC);
+  if (job.type === 'system') {
+    const line: RoomLine = { kind: 'system', speaker: '', text: job.text };
+    await save(line);
+    return broadcast(d, job.facilityId, { type: 'line', ...line, present: members.map((m) => m.pcName) }, members);
+  }
+  const speaker = members.find((m) => m.connectionId === job.connectionId);
+  if (!speaker || !pub) return; // left the room (or the place was unpublished) before the line was handled
+  const pcLine: RoomLine = { kind: 'pc', speaker: speaker.pcName, text: job.text };
+  lines.push(pcLine);
+  await broadcast(d, job.facilityId, { type: 'line', ...pcLine }, members);
+  const responderId = decideResponder(job, pub.npcs, speaker.npcId);
+  const npc = pub.npcs.find((n) => n.id === responderId);
+  if (!npc) return save();
+  const memories = (await d.connections.get(speaker.connectionId))?.memories?.[npc.id] ?? [];
+  const { system, messages, boundary } = buildRoomChat(pub.facility, npc, { pcName: speaker.pcName, memories }, lines, members.map((m) => m.pcName));
+  await broadcast(d, job.facilityId, { type: 'start', speaker: npc.name, npcId: npc.id }, members);
   let reply: string;
   try {
     let sent = 0;
     const r = await d.chat.chat({
       system,
       messages,
-      maxTokens: 400,
-      // Deltas are sent as they come, but never past the reply cap; the final text is cleaned once more.
+      maxTokens: REPLY_MAX_TOKENS,
+      // Deltas go out as they come, but never past the reply cap; the final text is cleaned once more.
       onDelta: async (delta) => {
         const piece = delta.split(boundary).join('').slice(0, Math.max(0, MAX_REPLY_CHARS - sent));
         sent += piece.length;
-        if (piece) await d.send(connectionId, { type: 'delta', text: piece });
+        if (piece) await broadcast(d, job.facilityId, { type: 'delta', text: piece }, members);
       },
     });
-    reply = cleanReply(r.text, boundary);
-    d.log({ msg: 'said', sub: c.sub, facility: c.session.facilityId, npc: c.session.npcId, inputTokens: r.inputTokens, outputTokens: r.outputTokens });
+    reply = cleanReply(r.text, boundary, r.truncated);
+    d.log({ msg: 'said', sub: speaker.sub, facility: job.facilityId, npc: npc.id, inputTokens: r.inputTokens, outputTokens: r.outputTokens, truncated: !!r.truncated });
   } catch (e) {
-    d.log({ msg: 'model error', sub: c.sub, error: e instanceof Error ? e.name : 'unknown' });
-    return d.send(connectionId, { type: 'error', code: 'model_unavailable' });
+    d.log({ msg: 'model error', sub: speaker.sub, error: e instanceof Error ? e.name : 'unknown' });
+    await save();
+    return broadcast(d, job.facilityId, { type: 'error', code: 'model_unavailable' }, members);
   }
   const answer = reply || '……';
-  await d.conversations.put(connectionId, { turns: [...history, { role: 'assistant', text: answer }], memories: conv.memories }, now + CONVERSATION_TTL_SEC);
-  await d.send(connectionId, { type: 'done', text: reply });
-  // The exchange goes to long-term memory after the reply is out; a failure only costs this exchange's memory.
+  const npcLine: RoomLine = { kind: 'npc', speaker: npc.name, npcId: npc.id, text: answer };
+  await save(npcLine);
+  await broadcast(d, job.facilityId, { type: 'done', ...npcLine }, members);
+  // The exchange goes to this NPC's memory of this PC; a failure only costs this exchange's memory.
   try {
-    const key = { npcId: c.session.npcId, pcId: c.session.pcId, actorId: c.sub, sessionId: sessionIdOf(connectionId) };
-    await d.memory.record(key, [{ role: 'user', text }, { role: 'assistant', text: answer }]);
+    const key = { npcId: npc.id, pcId: speaker.pcId, actorId: speaker.sub, sessionId: sessionIdOf(job.connectionId) };
+    await d.memory.record(key, [{ role: 'user', text: job.text }, { role: 'assistant', text: answer }]);
   } catch (e) {
     d.log({ msg: 'memory error', op: 'record', error: e instanceof Error ? e.name : 'unknown' });
   }
 }
 
 /** $default route: ping / hello / say (JSON, at most 4 KB). */
-export async function handleMessage(d: Deps, connectionId: string, raw: string | undefined): Promise<void> {
+export async function handleMessage(d: Deps, connectionId: string, raw: string | undefined): Promise<unknown> {
   const c = await d.connections.get(connectionId);
   if (!c) return d.close(connectionId);
   if (d.now() - c.connectedAt > MAX_CONNECTION_SEC) {
@@ -410,7 +476,7 @@ export async function handleMessage(d: Deps, connectionId: string, raw: string |
     await d.send(connectionId, { type: 'reauth' });
     return d.close(connectionId);
   }
-  let msg: { type?: unknown; t?: unknown; text?: unknown } | null = null;
+  let msg: { type?: unknown; t?: unknown; text?: unknown; to?: unknown } | null = null;
   if (raw && Buffer.byteLength(raw) <= MAX_MESSAGE_BYTES) {
     try {
       msg = JSON.parse(raw);
@@ -419,10 +485,11 @@ export async function handleMessage(d: Deps, connectionId: string, raw: string |
     }
   }
   if (msg?.type === 'ping') {
+    if (c.session) await d.rooms.touch(c.session.facilityId, connectionId, d.now()); // heartbeat
     const t = typeof msg.t === 'number' && Number.isFinite(msg.t) ? msg.t : null;
     return d.send(connectionId, { type: 'pong', t, serverTime: d.now(), username: c.username, role: c.role });
   }
   if (msg?.type === 'hello') return hello(d, connectionId, c);
-  if (msg?.type === 'say') return say(d, connectionId, c, msg.text);
+  if (msg?.type === 'say') return say(d, connectionId, c, msg.text, msg.to);
   return d.send(connectionId, { type: 'error', code: 'unsupported_message' });
 }

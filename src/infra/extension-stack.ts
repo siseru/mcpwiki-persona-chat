@@ -8,9 +8,11 @@ import {
   aws_dynamodb as ddb,
   aws_iam as iam,
   aws_lambda as lambda,
+  aws_lambda_event_sources as eventSources,
   aws_logs as logs,
   aws_s3 as s3,
   aws_s3_deployment as s3deploy,
+  aws_sqs as sqs,
 } from 'aws-cdk-lib';
 import type { Construct } from 'constructs';
 import { acknowledge } from './nag.js';
@@ -133,8 +135,9 @@ export class ExtensionStack extends Stack {
     // Drafts wait for the model: just under the HTTP API's 30 s integration limit.
     const httpFn = fn('HttpFn', 'http', 'HTTP API (tickets, facilities, drafts)', Duration.seconds(29));
     const authorizerFn = fn('AuthorizerFn', 'authorize', 'WebSocket $connect authorizer');
-    // Replies stream from the model: just under the WebSocket integration's 29 s limit.
-    const wsFn = fn('WsFn', 'ws', 'WebSocket routes (conversations)', Duration.seconds(28));
+    const wsFn = fn('WsFn', 'ws', 'WebSocket routes (presence, queueing lines)');
+    // The room worker answers lines one room at a time (SQS FIFO, group = facility) and streams the reply.
+    const workerFn = fn('WorkerFn', 'worker', 'room worker (NPC replies)', Duration.seconds(60));
     // Least privilege: tickets are written by one function and consumed by another; connections by the routes; only
     // the HTTP function touches the catalog.
     httpFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:PutItem', 'dynamodb:UpdateItem'], resources: [table.tableArn] })); // tickets, draft budgets
@@ -146,15 +149,34 @@ export class ExtensionStack extends Stack {
       ...US_PROFILE_REGIONS.map((r) => `arn:aws:bedrock:${r}::foundation-model/${foundationModel}`),
     ];
     httpFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['bedrock:InvokeModel'], resources: modelArns }));
-    // Conversations: the same model, streamed.
-    wsFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['bedrock:InvokeModelWithResponseStream'], resources: modelArns }));
+    // Conversations: the same model, streamed (by the room worker).
+    workerFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['bedrock:InvokeModelWithResponseStream'], resources: modelArns }));
     httpFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:DeleteItem', 'dynamodb:Scan'], resources: [catalog.tableArn] }));
     authorizerFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:DeleteItem'], resources: [table.tableArn] }));
-    // Connections, conversation logs and chat budgets; published snapshots are read only.
-    wsFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:DeleteItem', 'dynamodb:UpdateItem'], resources: [table.tableArn] }));
-    wsFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:GetItem'], resources: [catalog.tableArn] }));
-    // Memory: add events, list one NPC x PC namespace. No deletion or editing here (that is the DM's, Task 11).
-    wsFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['bedrock-agentcore:CreateEvent', 'bedrock-agentcore:ListMemoryRecords'], resources: [memory.attrMemoryArn] }));
+    // Connections, rooms, room histories and chat budgets; published snapshots are read only.
+    for (const f of [wsFn, workerFn]) {
+      f.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:DeleteItem', 'dynamodb:UpdateItem'], resources: [table.tableArn] }));
+      f.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:GetItem'], resources: [catalog.tableArn] }));
+    }
+    // Memory: the routes recall (list one NPC x PC namespace) when a PC joins; the worker adds events. No deletion or
+    // editing here (that is the DM's, Task 11).
+    wsFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['bedrock-agentcore:ListMemoryRecords'], resources: [memory.attrMemoryArn] }));
+    workerFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['bedrock-agentcore:CreateEvent'], resources: [memory.attrMemoryArn] }));
+    // Lines of a room, in order: FIFO, one message group per facility. Failed jobs end in the dead-letter queue.
+    // Encrypted with SQS-managed keys (lines are player text; no key sharing needed).
+    const deadLetters = new sqs.Queue(this, 'RoomJobsDlq', { fifo: true, retentionPeriod: Duration.days(4), enforceSSL: true, encryption: sqs.QueueEncryption.SQS_MANAGED });
+    const roomJobs = new sqs.Queue(this, 'RoomJobs', {
+      fifo: true,
+      visibilityTimeout: Duration.seconds(120), // >= the worker's timeout
+      retentionPeriod: Duration.hours(1), // a line nobody answered within an hour is no longer worth answering
+      deadLetterQueue: { queue: deadLetters, maxReceiveCount: 2 },
+      enforceSSL: true,
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+    });
+    roomJobs.grantSendMessages(wsFn);
+    workerFn.addEventSource(new eventSources.SqsEventSource(roomJobs, { batchSize: 1 }));
+    workerFn.addEnvironment('QUEUE_URL', roomJobs.queueUrl);
+    wsFn.addEnvironment('QUEUE_URL', roomJobs.queueUrl);
 
     // ---------------------------------------------------------------- APIs
     const http = new apigw.HttpApi(this, 'TicketApi', {
@@ -199,6 +221,10 @@ export class ExtensionStack extends Stack {
       throttle: { rateLimit: 20, burstLimit: 40 },
     });
     wsStage.grantManagementApiAccess(wsFn);
+    wsStage.grantManagementApiAccess(workerFn);
+    // Built from the API id, not the stage: the stage depends on the routes, which depend on the functions.
+    const socketEndpoint = `https://${ws.apiId}.execute-api.${this.region}.amazonaws.com/${props.envName}`;
+    for (const f of [wsFn, workerFn]) f.addEnvironment('SOCKET_ENDPOINT', socketEndpoint);
 
     // ---------------------------------------------------------------- bundle + its runtime configuration
     // Old bundles stay (prune: false): the wiki keeps serving the version its configuration pins until it is
@@ -229,17 +255,18 @@ export class ExtensionStack extends Stack {
     ]);
     acknowledge(table, [{ id: 'AwsSolutions-DDB3', reason: 'Tickets live 30 seconds and connections until disconnect: nothing to recover.' }]);
     if (!prod) acknowledge(catalog, [{ id: 'AwsSolutions-DDB3', reason: 'dev: publications are rebuilt from the wiki articles by publishing again.' }]);
-    for (const f of [httpFn, authorizerFn, wsFn]) {
+    for (const f of [httpFn, authorizerFn, wsFn, workerFn]) {
       acknowledge(f, [
         { id: 'AwsSolutions-IAM4[Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]', reason: 'Writes its own logs only.' },
       ]);
     }
-    acknowledge(wsFn, [
+    for (const f of [wsFn, workerFn]) acknowledge(f, [
       {
         id: `AwsSolutions-IAM5[Resource::arn:aws:execute-api:${this.region}:${this.account}:<${this.getLogicalId(ws.node.defaultChild as apigw.CfnApi)}>/${props.envName}/*/@connections/*]`,
         reason: 'Posts to / closes any connection of its own WebSocket stage.',
       },
     ]);
+    acknowledge(deadLetters, [{ id: 'AwsSolutions-SQS3', reason: 'This is the dead-letter queue.' }]);
     acknowledge(ws, [
       { id: 'AwsSolutions-APIG4', reason: '$connect has the ticket authorizer; $default and $disconnect only run on an authorized connection.' },
       { id: 'AwsSolutions-APIG1', reason: 'WebSocket access logging needs the account-wide API Gateway CloudWatch role, which this stack does not own; the route function logs connect, disconnect and refusals.' },

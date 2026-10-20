@@ -30,3 +30,7 @@ skip-check:
   # WebSocket access logging needs the account-wide API Gateway CloudWatch role, which this stack does not own;
   # the route function logs connect / disconnect instead. The HTTP ticket API has access logs.
   - CKV_AWS_95
+  # The room queues are encrypted with SQS-managed keys (SqsManagedSseEnabled: true, checked in
+  # test/extension.test.ts); this checkov version only accepts a KMS key (KmsMasterKeyId), which would add key
+  # calls and permissions without a sharing need.
+  - CKV_AWS_27
