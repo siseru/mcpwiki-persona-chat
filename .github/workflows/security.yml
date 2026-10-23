@@ -32,7 +32,7 @@ jobs:
           docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.1 \
             git /repo --redact --exit-code 1 --report-format sarif --report-path /repo/gitleaks.sarif
       - if: always() && vars.CODE_SCANNING_ENABLED == 'true'
-        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
         with:
           sarif_file: gitleaks.sarif
           category: gitleaks
@@ -54,7 +54,7 @@ jobs:
           persist-credentials: false
       # OSV includes the OpenSSF malicious-packages feed (MAL-* advisories); the weekly schedule re-checks
       # already-merged lockfiles as new advisories are published.
-      - uses: google/osv-scanner-action/osv-scanner-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
+      - uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
         with:
           scan-args: |-
             --lockfile=package-lock.json
@@ -101,7 +101,7 @@ jobs:
           pipx run --spec 'checkov==3.3.25' checkov --config-file .checkov.yaml -d cdk.out \
             --output cli --output sarif --output-file-path console,checkov.sarif
       - if: always() && vars.CODE_SCANNING_ENABLED == 'true'
-        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
         with:
           sarif_file: checkov.sarif
           category: checkov
@@ -125,7 +125,7 @@ jobs:
       - name: zizmor
         run: pipx run 'zizmor==1.30.1' --format sarif .github/workflows > zizmor.sarif
       - if: always() && vars.CODE_SCANNING_ENABLED == 'true'
-        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
         with:
           sarif_file: zizmor.sarif
           category: zizmor
