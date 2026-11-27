@@ -32,7 +32,7 @@ jobs:
           docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.1 \
             git /repo --redact --exit-code 1 --report-format sarif --report-path /repo/gitleaks.sarif
       - if: always() && vars.CODE_SCANNING_ENABLED == 'true'
-        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: gitleaks.sarif
           category: gitleaks
@@ -54,7 +54,7 @@ jobs:
           persist-credentials: false
       # OSV includes the OpenSSF malicious-packages feed (MAL-* advisories); the weekly schedule re-checks
       # already-merged lockfiles as new advisories are published.
-      - uses: google/osv-scanner-action/osv-scanner-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
+      - uses: google/osv-scanner-action/osv-scanner-action@32d3cd482bdadfb38b186c0ad1b031902d55d932 # v2.7.1
         with:
           scan-args: |-
             --lockfile=package-lock.json
@@ -70,7 +70,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+      - uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
         with:
           fail-on-severity: moderate
           comment-summary-in-pr: on-failure
@@ -101,7 +101,7 @@ jobs:
           pipx run --spec 'checkov==3.3.25' checkov --config-file .checkov.yaml -d cdk.out \
             --output cli --output sarif --output-file-path console,checkov.sarif
       - if: always() && vars.CODE_SCANNING_ENABLED == 'true'
-        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: checkov.sarif
           category: checkov
@@ -125,7 +125,7 @@ jobs:
       - name: zizmor
         run: pipx run 'zizmor==1.30.1' --format sarif .github/workflows > zizmor.sarif
       - if: always() && vars.CODE_SCANNING_ENABLED == 'true'
-        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: zizmor.sarif
           category: zizmor
